@@ -70,6 +70,11 @@ class Settings(BaseSettings):
     llm_max_tokens: int = Field(default=4096, ge=1)
     llm_auth_header: Literal["x-api-key", "authorization"] = "x-api-key"
 
+    context_recent_turns: int = Field(default=12, ge=1)
+    session_cache_ttl_seconds: int = Field(default=300, ge=1)
+    agent_run_timeout_seconds: float = Field(default=120, gt=0)
+    api_token: SecretStr = SecretStr("")
+
     @classmethod
     def settings_customise_sources(
         cls,

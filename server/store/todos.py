@@ -89,7 +89,12 @@ class TodoStore:
         self.session_factory = session_factory
 
     async def create(
-        self, *, user_id: str, session_id: str, title: str, create_key: str
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        title: str,
+        create_key: str,
     ) -> TodoItem:
         """创建待办；唯一键竞争时回读已提交结果，相同调用不会重复写入。"""
         existing_query = select(TodoModel).where(
@@ -152,7 +157,13 @@ class TodoStore:
             rows = list((await session.scalars(query)).all())
             return [to_item(row) for row in rows[:limit]], len(rows) > limit
 
-    async def complete(self, *, user_id: str, session_id: str, todo_id: str) -> TodoItem | None:
+    async def complete(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        todo_id: str,
+    ) -> TodoItem | None:
         """完成当前窗口的待办；重复完成保持成功，不更改原完成时间。"""
         query = (
             select(TodoModel)
@@ -172,7 +183,13 @@ class TodoStore:
                 row.updated_at = utc_now()
             return to_item(row)
 
-    async def delete(self, *, user_id: str, session_id: str, todo_id: str) -> bool:
+    async def delete(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        todo_id: str,
+    ) -> bool:
         """删除操作在 SQL 条件中同时校验用户与 Session，不能仅凭 ID 修改记录。"""
         statement = delete(TodoModel).where(
             TodoModel.id == todo_id,

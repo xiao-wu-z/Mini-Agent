@@ -151,6 +151,8 @@ while rounds < max_rounds:
 - MySQL、Redis 通过 `docker-compose.yml` 启动，连接参数与对应应用环境一致。
 - 各环境使用独立 Compose 项目名和数据卷，同机并行运行时使用不同宿主机端口。
 - 数据库变更使用 Alembic；不在服务启动时自动建表、改表或重置数据。
+- SQL 只保留 `migrations/sql/schema.sql` 一份当前结构，数据库变更时同步更新；
+  历史变更由 Git 和 Alembic revision 留痕，已有数据库通过 Alembic 升级。
 - 数据卷中的 MySQL 已初始化后，修改 dotenv 不等于修改数据库账号密码。
 - 不为日常启动执行 `down -v` 等清空数据操作。
 

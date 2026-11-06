@@ -94,7 +94,9 @@ class TodoHandler:
             create_key = sha256(f"{context.run_id}:{context.tool_use_id}".encode()).hexdigest()
             try:
                 item = await self.store.create(
-                    **scope, title=arguments.title, create_key=create_key
+                    **scope,
+                    title=arguments.title,
+                    create_key=create_key,
                 )
             except TodoConflictError as exc:
                 raise SkillError(
@@ -102,11 +104,17 @@ class TodoHandler:
                 ) from exc
             return {"action": "create", "item": item.model_dump(mode="json")}
         if arguments.action == "complete":
-            item = await self.store.complete(**scope, todo_id=arguments.todo_id)
+            item = await self.store.complete(
+                **scope,
+                todo_id=arguments.todo_id,
+            )
             if item is None:
                 raise SkillError(SkillErrorCode.NOT_FOUND, "当前会话中未找到该待办。")
             return {"action": "complete", "item": item.model_dump(mode="json")}
-        was_deleted = await self.store.delete(**scope, todo_id=arguments.todo_id)
+        was_deleted = await self.store.delete(
+            **scope,
+            todo_id=arguments.todo_id,
+        )
         if not was_deleted:
             raise SkillError(SkillErrorCode.NOT_FOUND, "当前会话中未找到该待办。")
         return {"action": "delete", "todo_id": arguments.todo_id, "deleted": True}

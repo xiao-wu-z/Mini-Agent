@@ -206,15 +206,16 @@ Todo 的 `action` 支持 `create`、`list`、`complete`、`delete`。
 
 ```bash
 uv run python -m scripts.run_agent '计算 128 乘以 36'
-# 同一个用户的两个窗口显式使用不同会话 ID
-uv run python -m scripts.run_agent --user-id user-a --session-id window-1 '查杭州明天天气，记待办带伞'
-uv run python -m scripts.run_agent --user-id user-a --session-id window-2 '记待办：周五提交周报'
-uv run python -m scripts.run_agent --user-id user-a --session-id window-1 '列出我的待办'
+# 两次不传 session-id 的调用各自创建新窗口，并打印会话 ID
+uv run python -m scripts.run_agent --user-id user-a --session-title 天气 '查杭州明天天气，记待办带伞'
+uv run python -m scripts.run_agent --user-id user-a --session-title 周报 '记待办：周五提交周报'
+# 用第一次打印的真实会话 ID 接着聊
+uv run python -m scripts.run_agent --user-id user-a --session-id '<第一次返回的ID>' '列出我的待办'
 ```
 
-命令行身份参数仅用于本地演示，不构成认证；未来 HTTP 接口需从已认证的请求中取得身份。
-不传参数时使用本地演示用户并生成新的 Session ID，运行结束会打印该 ID。
-Todo 可以跨命令恢复；对话历史目前仍需调用方通过 `history` 显式接续。
+命令行身份参数仅用于本地演示，不构成认证。不传身份时使用本地演示用户。
+默认通过会话服务自动读取和保存历史；使用 `--session-id` 恢复已有会话，归属不匹配返回错误。
+只调试 Loop 时显式使用 `--stateless`，此模式不保存对话历史。
 
 `echo` 模式仅用于检查入口，不会自主调用工具。测试中的 Mock 模型覆盖完整工具闭环，
 不需要真实 Key，也不依赖 MySQL 或 Redis。
@@ -240,7 +241,7 @@ Loop 为每次执行补充 run_id / tool_use_id，模型不能通过业务参数
 新增调用使用运行和工具调用标识去重；这不代表同一自然语言请求跨 Run 自动去重。
 在应用路由中可以通过 `Depends(server.dependencies.get_tools)` 获取已装配的工具集合。
 
-每次调用独立持有消息副本，通过 `history` 显式接续；后续 Session 层负责按用户和窗口持久化历史。
+直接调用 Loop 时通过 `history` 显式接续；HTTP 和默认 CLI 使用 ConversationService 自动持久化历史。
 默认最多调用模型 8 轮；同一轮的多工具按顺序执行并集中回灌。工具执行超时、未知工具、
 参数不合法及执行异常均转为 `is_error=true` 的结果，供模型修正。
 达到轮次上限返回 `max_rounds`；模型输出截断返回 `max_tokens`，不会执行截断响应中的工具。
@@ -249,6 +250,50 @@ LLM 网络错误、协议错误向调用方抛出；任务取消会继续传播�
 完整 assistant 内容块原样回灌，包括供应商返回的 thinking/signature，保证协议完整性；
 对用户只返回 text 块。每次运行返回 `run_id`、`rounds`、`messages` 和 `tool_traces`，
 日志记录工具名称、调用 ID、耗时及错误状态，不输出模型内部推理或工具参数。
+
+## 会话与对话历史
+
+参考 mt-agent 的基本链路：校验会话归属 → 读取历史 → 组装 context → 执行 Loop → 保存整轮消息。
+
+业务只使用两张会话相关表：`agent_session` 保存用户归属、标题和消息数量水位，
+`agent_message` 保存有序消息，通过 `turn_id` 标识一次用户输入及其全部工具调用。
+MySQL 保存完整历史，Redis 缓存历史读取结果；缓存丢失或不可用时回源 MySQL，聊天仍可继续。
+缓存按消息数量水位区分版本，避免旧读取覆盖新历史。
+
+`server/context.py` 只保留最近若干完整对话轮，默认 12 轮，通过
+`AGENT_CONTEXT_RECENT_TURNS` 调整。tool_use 和对应 tool_result 不拆散。
+系统提示词和工具 Schema 每次单独组装，不重复保存。
+原始历史不删除；当前不做向量检索和语义摘要，超出窗口的事实不会自动进入本轮 context。
+
+成功的一轮消息在短事务中一次性保存，不保存未配对的工具块。失败不自动重试写工具，
+也不保存不完整的本轮消息；工具可能已经产生副作用，重试前应先查询业务状态。
+同窗口在单应用进程内用 asyncio.Lock 避免并发；基础版本使用单 worker 部署。
+此锁不提供跨进程互斥，不宣称写工具具有跨进程 exactly-once 保证。
+
+| 方法 | 路径 | 功能 |
+| --- | --- | --- |
+| POST | /sessions | 创建会话，body 为 `{"title":"天气"}` |
+| GET | /sessions | 当前用户的会话列表，支持 limit/offset |
+| GET | /sessions/{id} | 校验归属并读取会话 |
+| GET | /sessions/{id}/messages | 历史分页，支持 after/limit |
+| POST | /sessions/{id}/chat | 接着聊，body 为 `{"message":"继续"}` |
+
+开发环境通过 X-User-ID 指定身份；这是可信调用方协议，不是登录认证。
+生产入口由可信网关注入身份并提供 AGENT_API_TOKEN 对应的 Bearer Token。
+公开历史过滤 thinking/signature，内部模型回灌保留完整协议块。
+
+```bash
+curl -X POST http://127.0.0.1:8000/sessions \
+  -H 'X-User-ID: user-a' -H 'Content-Type: application/json' \
+  -d '{"title":"天气"}'
+curl -X POST 'http://127.0.0.1:8000/sessions/<返回的ID>/chat' \
+  -H 'X-User-ID: user-a' -H 'Content-Type: application/json' \
+  -d '{"message":"查杭州天气并记待办带伞"}'
+```
+
+0003 迁移将旧消息的 run_id 改为 turn_id，保留原消息，将旧运行表改名为
+agent_runs_archive 仅供审计，不参与当前代码。旧迁移与 SQL 留痕保留不变。
+因为新对话不再创建运行记录，恢复旧外键模型需要人工数据映射，0003 不提供自动 downgrade。
 
 ## MySQL 与迁移
 
@@ -267,6 +312,9 @@ APP_ENV=development uv run alembic current
 ```
 
 当前首个迁移创建 `todos` 表；所有查询和写操作均限定 user_id / session_id。
+第二个迁移是原运行模型；第三个迁移收敛为基础两表并保留旧运行记录归档。当前结构统一保存在
+[`migrations/sql/schema.sql`](migrations/sql/schema.sql)，历史变更由 Git 和 Alembic revision 留痕。
+SQL 文件用于审查留痕，常规升级只执行 Alembic，不重复执行 SQL 快照。
 业务账号和 Session ID 使用区分大小写的表排序规则，避免不同身份被视为相同。
 测试、生产迁移使用各自的 `APP_ENV`，提前核对目标库；测试环境需显式开启
 `AGENT_MYSQL_ENABLED=true`。
@@ -295,6 +343,10 @@ APP_ENV=testing AGENT_MYSQL_ENABLED=true uv run alembic upgrade head
 # 替换 TEST_PASSWORD；密码含 URL 保留字符时需要 URL 编码。
 MINI_AGENT_TEST_MYSQL_URL='mysql+asyncmy://mini_agent_test:TEST_PASSWORD@127.0.0.1:3307/mini_agent_test?charset=utf8mb4' \
   uv run pytest -q tests/integration/test_todo_mysql.py
+# 同时验证会话与 Redis；替换两种测试密码。
+MINI_AGENT_TEST_MYSQL_URL='mysql+asyncmy://mini_agent_test:TEST_PASSWORD@127.0.0.1:3307/mini_agent_test?charset=utf8mb4' \
+MINI_AGENT_TEST_REDIS_URL='redis://:TEST_REDIS_PASSWORD@127.0.0.1:6380/1' \
+  uv run pytest -q tests/integration
 ```
 
 集成测试只接受以 `_test` 结尾的数据库名，使用本次生成的独立用户标识并清理自己的数据。
@@ -309,9 +361,11 @@ config/                    # 开发、测试、生产公开默认配置
 docker-compose.yml         # MySQL / Redis、健康检查、独立持久化卷
 server/
   app.py                   # 应用工厂、客户端生命周期、CORS
+  conversations.py         # 读取历史、调用 Loop、保存整轮消息
   config.py                # 配置加载、校验与 SecretStr
   dependencies.py          # LLM、Redis 路由依赖
-  cache.py                 # Redis 客户端
+  context.py               # 最近完整对话轮的组装
+  cache.py                 # Redis 历史缓存和客户端
   llm.py                   # Anthropic 客户端与 Message、LLMTurn、ToolUse
   agent_loop.py            # 自研 while 循环和工具执行 trace
   tools.py                 # 四个工具定义、注册表、默认注册
@@ -321,6 +375,7 @@ server/
     _db.py                 # MySQL 连接池与 session 依赖
     base.py                # ORM 基类
     todos.py               # 待办模型与作用域隔离的持久化访问
+    sessions.py            # 会话和消息实体及短事务访问
 migrations/                # Alembic 迁移环境及版本目录
 skills/
   _shared/                 # 可信工具上下文和业务错误

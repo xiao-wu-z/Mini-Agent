@@ -132,7 +132,7 @@ class AgentLoop:
         # 每次调用独立持有消息，复用同一个 Loop 实例也不会共享会话状态。
         messages = [message.model_copy(deep=True) for message in (history or [])]
         messages.append(Message(role="user", content=user_input))
-        run_id = uuid4().hex
+        run_id = context.run_id if context is not None and context.run_id else uuid4().hex
         run_context = (context or ToolContext()).model_copy(update={"run_id": run_id})
         traces: list[ToolTrace] = []
         rounds = 0

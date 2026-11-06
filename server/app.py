@@ -2,14 +2,19 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-from server.cache import create_redis
+from server.agent_loop import AgentLoop
+from server.cache import SessionCache, create_redis
 from server.config import Settings, get_settings
+from server.conversations import ConversationService
 from server.llm import LLMClient
 from server.routes.health import router as health_router
+from server.routes.sessions import router as sessions_router
 from server.store._db import Database
+from server.store.sessions import ConversationCode, ConversationError, SessionStore
 from server.store.todos import TodoStore
 from server.tools import create_default_tools
 
@@ -40,6 +45,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 else None
             )
             app.state.tools = create_default_tools(todo_store=todo_store)
+            app.state.conversations = None
+            if app.state.database is not None:
+                app.state.conversations = ConversationService(
+                    SessionStore(app.state.database.session_factory),
+                    SessionCache(
+                        app.state.redis,
+                        ttl_seconds=settings.session_cache_ttl_seconds,
+                    ),
+                    AgentLoop(app.state.llm, app.state.tools),
+                    timeout_seconds=settings.agent_run_timeout_seconds,
+                    recent_turns=settings.context_recent_turns,
+                )
             yield
 
     app = FastAPI(
@@ -59,4 +76,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             allow_headers=["*"],
         )
     app.include_router(health_router)
+    app.include_router(sessions_router)
+
+    @app.exception_handler(ConversationError)
+    async def conversation_error(request: Request, exc: ConversationError) -> JSONResponse:
+        if exc.code == ConversationCode.SESSION_NOT_FOUND:
+            code = status.HTTP_404_NOT_FOUND
+        elif exc.code == ConversationCode.SESSION_BUSY:
+            code = status.HTTP_409_CONFLICT
+        elif exc.code == ConversationCode.RUN_TIMEOUT:
+            code = status.HTTP_504_GATEWAY_TIMEOUT
+        else:
+            code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return JSONResponse(status_code=code, content={"code": exc.code, "message": exc.message})
+
     return app

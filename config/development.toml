@@ -1,0 +1,11 @@
+# 公开的开发默认值；密码和 API Key 写入 .env.development。
+reload = true
+docs_enabled = true
+log_level = "DEBUG"
+cors_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+mysql_enabled = true
+mysql_user = "mini_agent"
+mysql_db = "mini_agent_dev"
+redis_enabled = false
+redis_db = 0
+llm_provider = "echo"

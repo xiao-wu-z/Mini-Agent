@@ -1,0 +1,10 @@
+# 单元测试默认不访问外部服务；集成测试可通过环境变量启用专用测试库。
+reload = false
+docs_enabled = true
+log_level = "WARNING"
+mysql_enabled = false
+mysql_user = "mini_agent_test"
+mysql_db = "mini_agent_test"
+redis_enabled = false
+redis_db = 1
+llm_provider = "echo"

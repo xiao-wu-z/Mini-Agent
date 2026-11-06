@@ -1,0 +1,12 @@
+# 生产连接地址、账号与密钥由部署环境注入。
+host = "0.0.0.0"
+reload = false
+docs_enabled = false
+log_level = "INFO"
+cors_origins = []
+mysql_enabled = true
+mysql_host = ""
+mysql_user = ""
+mysql_db = "mini_agent"
+redis_enabled = false
+llm_provider = "openai_compatible"

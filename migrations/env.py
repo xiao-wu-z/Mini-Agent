@@ -7,9 +7,10 @@ from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from server.config import get_settings
+from server.store import todos  # noqa: F401 -- 注册 ORM 模型，供 autogenerate 读取 metadata。
 from server.store.base import Base
 
-# 新增模型后，在这里 import 对应模块，让 autogenerate 识别 Base.metadata。
+# 新增模型后，在这里导入对应模块，让 autogenerate 识别 Base.metadata。
 target_metadata = Base.metadata
 settings = get_settings()
 if not settings.mysql_enabled:

@@ -120,7 +120,7 @@ async def test_repeated_tool_rounds_before_final():
         (tool_call(name="unknown"), "UNKNOWN_TOOL"),
         (tool_call(operation="add", left="invalid", right=2), "INVALID_ARGUMENTS"),
         (tool_call(operation="add", left=1), "INVALID_ARGUMENTS"),
-        (tool_call(operation="divide", left=1, right=0), "TOOL_ERROR"),
+        (tool_call(operation="divide", left=1, right=0), "INVALID_ARGUMENTS"),
     ],
 )
 async def test_tool_errors_are_fed_back_for_next_decision(call, code):
@@ -144,7 +144,7 @@ async def test_model_can_repair_invalid_arguments():
 
 
 async def test_timeout_is_a_tool_error():
-    async def wait(_):
+    async def wait(_, context):
         await asyncio.Event().wait()
 
     tools = create_default_tools()
@@ -216,7 +216,7 @@ async def test_history_can_be_reused_without_mutation():
 
 
 async def test_cancellation_propagates():
-    async def cancel(_):
+    async def cancel(_, context):
         raise asyncio.CancelledError()
 
     tools = create_default_tools()

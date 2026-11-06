@@ -10,6 +10,8 @@ from server.config import Settings, get_settings
 from server.llm import LLMClient
 from server.routes.health import router as health_router
 from server.store._db import Database
+from server.store.todos import TodoStore
+from server.tools import create_default_tools
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -32,6 +34,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 stack.push_async_callback(app.state.redis.aclose)
             app.state.llm = LLMClient(settings)
             stack.push_async_callback(app.state.llm.close)
+            todo_store = (
+                TodoStore(app.state.database.session_factory)
+                if app.state.database is not None
+                else None
+            )
+            app.state.tools = create_default_tools(todo_store=todo_store)
             yield
 
     app = FastAPI(

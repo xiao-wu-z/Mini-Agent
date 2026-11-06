@@ -57,7 +57,8 @@
 - 一个工具解决一项明确能力，描述中写清用途、必要输入和限制。
 - 工具名使用 snake_case，不允许同名注册静默覆盖。
 - 参数模型只暴露模型应该决定的业务字段；未知字段原则上使用 `extra="forbid"` 拒绝。
-- handler 接收校验后的参数对象，返回可 JSON 序列化的业务数据。
+- handler 接收 `(arguments, context)`：校验后的业务参数和调用方提供的可信上下文，
+  返回可 JSON 序列化的业务数据。用户与 Session 身份不进入模型可填写的 Schema。
 - handler 不直接构造 Anthropic 消息，不重复实现超时和通用错误封装。
 - 执行器统一处理 `UNKNOWN_TOOL`、`INVALID_ARGUMENTS`、`TOOL_TIMEOUT`、`TOOL_ERROR`。
 - 错误结果设置 `is_error=true`，让模型根据实际错误继续决策。

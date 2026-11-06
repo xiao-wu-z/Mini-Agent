@@ -16,7 +16,14 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from server.store.todos import TodoStore
+from skills._shared.context import ToolContext
 from skills.calculator.handler import CalculatorArgs, calculate
+from skills.search.handler import SearchArgs, search
+from skills.todo.handler import TodoArgs, TodoHandler
+from skills.weather.handler import WeatherArgs, weather
+
+TOOL_NAME_PATTERN = re.compile(r"[a-zA-Z0-9_-]{1,64}")
 
 # ============================================================================
 # 工具定义与注册表
@@ -25,12 +32,12 @@ from skills.calculator.handler import CalculatorArgs, calculate
 
 @dataclass(frozen=True)
 class Tool:
-    """工具声明：parameters 定义模型可填写的参数，handler 接收校验后的参数对象。"""
+    """工具声明：parameters 定义业务参数，handler 接收校验后的参数和可信上下文。"""
 
     name: str
     description: str
     parameters: type[BaseModel]
-    handler: Callable[[Any], Awaitable[Any]]
+    handler: Callable[[Any, ToolContext], Awaitable[Any]]
 
     def spec(self) -> dict[str, Any]:
         """生成 Anthropic Messages API 的单个工具声明。"""
@@ -56,7 +63,7 @@ class ToolRegistry:
         Raises:
             ValueError: 工具名称不合法、描述为空或名称已经注册。
         """
-        if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", tool.name):
+        if not TOOL_NAME_PATTERN.fullmatch(tool.name):
             raise ValueError("Tool name must be 1-64 letters, digits, underscores or hyphens")
         if not tool.description.strip():
             raise ValueError("Tool description is required")
@@ -78,7 +85,7 @@ class ToolRegistry:
 # ============================================================================
 
 
-def create_default_tools() -> ToolRegistry:
+def create_default_tools(*, todo_store: TodoStore | None = None) -> ToolRegistry:
     """创建独立的默认工具集合，新增能力在此注册对应 skill handler。"""
     registry = ToolRegistry()
     registry.register(
@@ -87,6 +94,39 @@ def create_default_tools() -> ToolRegistry:
             description="对两个数字做加、减、乘或除运算；除法的 right 不能为零。",
             parameters=CalculatorArgs,
             handler=calculate,
+        )
+    )
+    registry.register(
+        Tool(
+            name="search",
+            description=(
+                "搜索本地固定资料集，仅提供 Mock 结果，不是互联网实时搜索。未匹配返回空列表。"
+            ),
+            parameters=SearchArgs,
+            handler=search,
+        )
+    )
+    registry.register(
+        Tool(
+            name="todo",
+            description=(
+                "管理当前用户、当前会话的持久化待办。create 需要 title；list 支持状态过滤和分页；"
+                "complete/delete 必须使用之前结果返回的 todo_id，禁止编造 ID。"
+                "用户或会话身份由服务端提供，无需填写。"
+            ),
+            parameters=TodoArgs,
+            handler=TodoHandler(todo_store).run,
+        )
+    )
+    registry.register(
+        Tool(
+            name="weather",
+            description=(
+                "查询北京、上海、杭州、深圳、广州今天或明天的 Mock 天气。"
+                "数值是模拟数据，回答必须明确说明，不可声称是实时天气。"
+            ),
+            parameters=WeatherArgs,
+            handler=weather,
         )
     )
     return registry

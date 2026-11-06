@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 from server.llm import LLMTurn, Message, ToolUse
 from server.skill_runner import SkillRunner
 from server.tools import ToolRegistry
+from skills._shared.context import ToolContext
 
 logger = logging.getLogger(__name__)
 
@@ -103,12 +104,19 @@ class AgentLoop:
         self.max_rounds = max_rounds
         self.tool_timeout = tool_timeout
 
-    async def run(self, user_input: str, *, history: list[Message] | None = None) -> AgentResult:
+    async def run(
+        self,
+        user_input: str,
+        *,
+        history: list[Message] | None = None,
+        context: ToolContext | None = None,
+    ) -> AgentResult:
         """处理一次用户输入，执行工具后继续调用模型。
 
         Args:
             user_input: 当前用户输入，不允许为空或仅包含空白。
             history: 当前会话已有消息；调用前应已配对完成工具调用与结果。
+            context: 调用方提供的用户与 Session 身份；不传时不能执行 Todo 操作。
 
         Returns:
             最终文本、停止原因、完整消息以及工具执行 trace。
@@ -125,6 +133,7 @@ class AgentLoop:
         messages = [message.model_copy(deep=True) for message in (history or [])]
         messages.append(Message(role="user", content=user_input))
         run_id = uuid4().hex
+        run_context = (context or ToolContext()).model_copy(update={"run_id": run_id})
         traces: list[ToolTrace] = []
         rounds = 0
         specs = self.tools.specs()
@@ -181,7 +190,10 @@ class AgentLoop:
             results = []
             for call in calls:
                 started = monotonic()
-                result = await self.runner.execute(call, timeout=self.tool_timeout)
+                call_context = run_context.model_copy(update={"tool_use_id": call.id})
+                result = await self.runner.execute(
+                    call, timeout=self.tool_timeout, context=call_context
+                )
                 trace = ToolTrace(
                     round=rounds,
                     tool_use_id=call.id,

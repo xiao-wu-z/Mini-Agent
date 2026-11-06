@@ -17,6 +17,8 @@ uv sync --locked
 cp .env.development.example .env.development
 # 修改示例密码后启动 MySQL、Redis，等待健康检查通过。
 docker compose --env-file .env.development up -d --wait --wait-timeout 180
+# 创建业务表（首次安装或新增迁移后执行）
+APP_ENV=development uv run alembic upgrade head
 bash run_local.sh
 ```
 
@@ -163,8 +165,21 @@ Redis 客户端由应用 lifespan 创建并在退出时关闭。
 工具使用 `name`、`description`、`input_schema` 注册，Schema 由 Pydantic 参数模型生成。
 沿用 mtagent 的组织方式：`server/tools.py` 维护注册表和默认注册，`server/skill_runner.py`
 统一处理执行、超时和错误回灌，具体能力放在 `skills/<工具名>/handler.py`。
-第一阶段的 `skills/calculator/handler.py` 支持两数加、减、乘、除。
-增加工具时添加对应 handler 并注册，不需要修改 Loop。
+新增工具时添加对应 handler 并注册，不需要修改 Loop。当前工具如下：
+
+| 工具 | 参数 | 行为 |
+| --- | --- | --- |
+| calculator | operation、left、right | 两数加减乘除，拒绝除零、非有限数值和任意代码 |
+| search | query、limit | 搜索固定资料集；返回 `is_mock=true` 和 `mock://` 来源 |
+| weather | city、day | 五座城市今天/明天的固定模拟天气，返回 `is_mock=true` |
+| todo | action、title、todo_id、status、limit、offset | MySQL 持久化待办，按用户和会话隔离 |
+
+`weather` 支持北京、上海、杭州、深圳、广州，`day` 为 `today` / `tomorrow`。
+Mock 数据用于验证工具闭环，不可作为实际天气预报或实时网络搜索结果。
+
+Todo 的 `action` 支持 `create`、`list`、`complete`、`delete`。
+新增时填写 `title`；完成和删除时，`todo_id` 必须来自之前的工具结果。
+列表支持 `pending` / `completed` 过滤和 `limit` / `offset` 分页，返回 `has_more`。
 
 工具调用与回灌消息示例：
 
@@ -191,7 +206,15 @@ Redis 客户端由应用 lifespan 创建并在退出时关闭。
 
 ```bash
 uv run python -m scripts.run_agent '计算 128 乘以 36'
+# 同一个用户的两个窗口显式使用不同会话 ID
+uv run python -m scripts.run_agent --user-id user-a --session-id window-1 '查杭州明天天气，记待办带伞'
+uv run python -m scripts.run_agent --user-id user-a --session-id window-2 '记待办：周五提交周报'
+uv run python -m scripts.run_agent --user-id user-a --session-id window-1 '列出我的待办'
 ```
+
+命令行身份参数仅用于本地演示，不构成认证；未来 HTTP 接口需从已认证的请求中取得身份。
+不传参数时使用本地演示用户并生成新的 Session ID，运行结束会打印该 ID。
+Todo 可以跨命令恢复；对话历史目前仍需调用方通过 `history` 显式接续。
 
 `echo` 模式仅用于检查入口，不会自主调用工具。测试中的 Mock 模型覆盖完整工具闭环，
 不需要真实 Key，也不依赖 MySQL 或 Redis。
@@ -201,11 +224,21 @@ uv run python -m scripts.run_agent '计算 128 乘以 36'
 ```python
 from server.agent_loop import AgentLoop
 from server.tools import create_default_tools
+from server.store.todos import TodoStore
+from skills._shared.context import ToolContext
 
-loop = AgentLoop(llm, create_default_tools(), max_rounds=8, tool_timeout=10)
-first = await loop.run("计算 128 乘以 36")
-followup = await loop.run("再除以 2", history=first.messages)
+tools = create_default_tools(todo_store=TodoStore(database.session_factory))
+loop = AgentLoop(llm, tools, max_rounds=8, tool_timeout=10)
+context = ToolContext(user_id="user-a", session_id="window-1")
+first = await loop.run("计算 128 乘以 36", context=context)
+followup = await loop.run("再除以 2", history=first.messages, context=context)
 ```
+
+全部 handler 接收 `(arguments, context)`。上下文中的用户和 Session ID 由调用方提供，
+Loop 为每次执行补充 run_id / tool_use_id，模型不能通过业务参数改变归属。
+未提供身份或未注入数据库时，Todo 返回明确错误，不退化为内存待办。
+新增调用使用运行和工具调用标识去重；这不代表同一自然语言请求跨 Run 自动去重。
+在应用路由中可以通过 `Depends(server.dependencies.get_tools)` 获取已装配的工具集合。
 
 每次调用独立持有消息副本，通过 `history` 显式接续；后续 Session 层负责按用户和窗口持久化历史。
 默认最多调用模型 8 轮；同一轮的多工具按顺序执行并集中回灌。工具执行超时、未知工具、
@@ -233,8 +266,10 @@ APP_ENV=development uv run alembic upgrade head
 APP_ENV=development uv run alembic current
 ```
 
-目前未定义业务模型，迁移目录为空。测试、生产迁移使用各自的 `APP_ENV`，
-并提前核对目标库。测试环境需显式开启 `AGENT_MYSQL_ENABLED=true`。
+当前首个迁移创建 `todos` 表；所有查询和写操作均限定 user_id / session_id。
+业务账号和 Session ID 使用区分大小写的表排序规则，避免不同身份被视为相同。
+测试、生产迁移使用各自的 `APP_ENV`，提前核对目标库；测试环境需显式开启
+`AGENT_MYSQL_ENABLED=true`。
 
 ## Redis
 
@@ -251,6 +286,19 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
+常规测试包含临时 SQLite 上的工具持久化测试，不连接真实 MySQL。
+真实 MySQL 集成测试默认跳过；需要验证时先启动测试容器并迁移专用测试库：
+
+```bash
+docker compose --env-file .env.testing up -d --wait
+APP_ENV=testing AGENT_MYSQL_ENABLED=true uv run alembic upgrade head
+# 替换 TEST_PASSWORD；密码含 URL 保留字符时需要 URL 编码。
+MINI_AGENT_TEST_MYSQL_URL='mysql+asyncmy://mini_agent_test:TEST_PASSWORD@127.0.0.1:3307/mini_agent_test?charset=utf8mb4' \
+  uv run pytest -q tests/integration/test_todo_mysql.py
+```
+
+集成测试只接受以 `_test` 结尾的数据库名，使用本次生成的独立用户标识并清理自己的数据。
+
 添加依赖使用 `uv add 包名`，开发依赖使用 `uv add --dev 包名`。
 提交 `pyproject.toml` 与 `uv.lock`，以便复现相同依赖版本。
 
@@ -266,19 +314,25 @@ server/
   cache.py                 # Redis 客户端
   llm.py                   # Anthropic 客户端与 Message、LLMTurn、ToolUse
   agent_loop.py            # 自研 while 循环和工具执行 trace
-  tools.py                 # 工具定义、注册表、默认注册
+  tools.py                 # 四个工具定义、注册表、默认注册
   skill_runner.py          # 参数校验、工具执行、超时、错误回灌
   routes/health.py         # 存活和就绪探针
   store/
     _db.py                 # MySQL 连接池与 session 依赖
     base.py                # ORM 基类
+    todos.py               # 待办模型与作用域隔离的持久化访问
 migrations/                # Alembic 迁移环境及版本目录
 skills/
+  _shared/                 # 可信工具上下文和业务错误
   calculator/
     handler.py             # 计算器参数与实现
+  search/handler.py        # Mock 资料搜索
+  todo/handler.py          # 待办增删改查
+  weather/handler.py       # Mock 天气
 tests/
   conftest.py              # 测试环境隔离
   unit/                    # Loop、LLM、配置、健康检查、生命周期测试
+  integration/             # 显式启用的 MySQL 待办持久化验证
 scripts/run_agent.py       # 最小 Agent 命令行示例
 .env.*.example             # 各环境配置填写示例
 main.py                    # 保持兼容的应用入口

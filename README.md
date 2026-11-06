@@ -8,27 +8,63 @@ Python 3.12 + FastAPI 服务骨架，使用 uv 管理依赖。沿用参考项目
 
 ## 安装与启动
 
+准备 Python/uv 和已启动的 Docker（含 Compose v2）。MySQL、Redis 由 Compose 运行，
+Python 应用在宿主机运行，容器与应用共用 `.env.development` 中的连接参数。
+
 ```bash
 uv sync --locked
 # 首次拉取项目时复制配置；不要覆盖已经填写的本地配置。
 cp .env.development.example .env.development
+# 修改示例密码后启动 MySQL、Redis，等待健康检查通过。
+docker compose --env-file .env.development up -d --wait --wait-timeout 180
+bash run_local.sh
 ```
 
-在 `.env.development` 中填写 MySQL 地址、账号、密码和数据库名。
-数据库需要提前创建，例如：
+默认使用 MySQL 8.4 和 Redis 7.4。MySQL 首次启动自动创建 `mini_agent_dev`
+及应用账号，无需手工建库；Redis 启用密码和 AOF 持久化。
+应用配置中的数据库密码和 Redis 密码同时用于初始化对应容器。
+`DOCKER_MYSQL_ROOT_PASSWORD` 仅用于容器管理，应用使用独立的 `AGENT_MYSQL_USER`。
+示例中的密码只用于本地开发，生产必须替换。
 
-```sql
-CREATE DATABASE mini_agent_dev CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE DATABASE mini_agent_test CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-```
+默认只向宿主机 `127.0.0.1` 映射端口：MySQL `3306`、Redis `6379`。
+端口冲突时修改 `.env.development` 中的 `AGENT_MYSQL_PORT` / `AGENT_REDIS_PORT`，
+Compose 与 Python 应用会读取同一组值；容器内部仍使用 `3306` / `6379`。
+应用在宿主机运行，因此 `AGENT_MYSQL_HOST` / `AGENT_REDIS_HOST` 保持 `127.0.0.1`。
 
-分别为开发和测试库配置有权限的账号。服务不会自动创建数据库或业务表。
-启动开发环境：
+## 容器管理
 
 ```bash
-bash run_local.sh
-# 等价命令：APP_ENV=development uv run python main.py
+# 查看状态、日志
+docker compose --env-file .env.development ps
+docker compose --env-file .env.development logs -f mysql redis
+
+# 停止并移除容器；保留数据卷
+docker compose --env-file .env.development down
+
+# 再次启动，继续使用原数据
+docker compose --env-file .env.development up -d --wait
 ```
+
+MySQL 和 Redis 分别使用命名卷 `mysql_data` / `redis_data`，按 Compose 项目名隔离。
+不要对需要保留的数据执行 `down -v`，它会删除数据卷。
+MySQL 的建库、建用户和初始密码只对空数据卷生效；已有数据时修改 dotenv
+不会修改库内密码，需要执行 SQL 变更账号并同步应用配置。
+
+测试容器使用独立项目名、数据卷和宿主机端口（MySQL `3307`、Redis `6380`）：
+
+```bash
+cp .env.testing.example .env.testing
+docker compose --env-file .env.testing up -d --wait --wait-timeout 180
+# 开启测试服务连接后，启动测试环境应用
+APP_ENV=testing AGENT_MYSQL_ENABLED=true AGENT_REDIS_ENABLED=true uv run python main.py
+```
+
+测试 MySQL 自动创建 `mini_agent_test`，使用独立测试账号；单元测试仍默认隔离外部服务。
+生产可使用同一 Compose 文件和 `.env.production`，需要填写完整账号、密码及宿主机连接地址。
+各环境通过 `COMPOSE_PROJECT_NAME` 隔离数据，若在同机同时运行，需配置不同宿主机端口。
+部署在不同主机的应用需要单独配置网络访问；当前端口映射仅用于同机访问。
+
+## 应用运行
 
 PyCharm 选择 `.venv/bin/python`，运行 `main.py`，环境变量设置 `APP_ENV=development`。
 命令行也支持 `uv run uvicorn main:app --reload`，但直接使用 Uvicorn 时，
@@ -127,7 +163,7 @@ APP_ENV=development uv run alembic current
 
 ## Redis
 
-默认关闭；需要时设置 `AGENT_REDIS_ENABLED=true`，填写 `AGENT_REDIS_HOST`、
+开发环境默认启用 Docker Redis；其他环境通过 `AGENT_REDIS_ENABLED` 控制，填写 `AGENT_REDIS_HOST`、
 `AGENT_REDIS_PORT`、`AGENT_REDIS_DB`、`AGENT_REDIS_PASSWORD`。
 TLS 服务启用 `AGENT_REDIS_SSL=true`。开发和测试默认使用不同的 Redis DB。
 业务路由通过 `Depends(server.dependencies.get_redis)` 获取客户端。
@@ -147,6 +183,7 @@ uv run ruff format --check .
 
 ```text
 config/                    # 开发、测试、生产公开默认配置
+docker-compose.yml         # MySQL / Redis、健康检查、独立持久化卷
 server/
   app.py                   # 应用工厂、客户端生命周期、CORS
   config.py                # 配置加载、校验与 SecretStr

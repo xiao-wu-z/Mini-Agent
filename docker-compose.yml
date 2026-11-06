@@ -1,0 +1,63 @@
+# MySQL / Redis 基础设施；应用在宿主机运行，共用所选环境的 dotenv。
+# docker compose --env-file .env.development up -d --wait
+name: ${COMPOSE_PROJECT_NAME:-mini-agent-development}
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DOCKER_MYSQL_ROOT_PASSWORD:?Set DOCKER_MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${AGENT_MYSQL_DB:?Set AGENT_MYSQL_DB}
+      MYSQL_USER: ${AGENT_MYSQL_USER:?Set AGENT_MYSQL_USER}
+      MYSQL_PASSWORD: ${AGENT_MYSQL_PASSWORD:?Set AGENT_MYSQL_PASSWORD}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "127.0.0.1:${AGENT_MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          MYSQL_PWD="$${MYSQL_PASSWORD}" mysql
+          --protocol=TCP --host=127.0.0.1
+          --user="$${MYSQL_USER}" --database="$${MYSQL_DATABASE}"
+          --execute='SELECT 1' --silent > /dev/null
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${AGENT_REDIS_PASSWORD:?Set AGENT_REDIS_PASSWORD}
+      TZ: Asia/Shanghai
+    command:
+      - /bin/sh
+      - -ec
+      - >-
+        exec docker-entrypoint.sh redis-server
+        --appendonly yes --appendfsync everysec
+        --requirepass "$${REDIS_PASSWORD}"
+    ports:
+      - "127.0.0.1:${AGENT_REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - REDISCLI_AUTH="$${REDIS_PASSWORD}" redis-cli ping | grep -qx PONG
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  mysql_data:
+  redis_data:

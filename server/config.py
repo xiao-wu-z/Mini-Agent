@@ -62,11 +62,13 @@ class Settings(BaseSettings):
     redis_ssl: bool = False
     redis_timeout: float = Field(default=3, gt=0)
 
-    llm_provider: Literal["echo", "openai_compatible"] = "echo"
+    llm_provider: Literal["echo", "anthropic"] = "echo"
     llm_base_url: str = ""
     llm_api_key: SecretStr = SecretStr("")
     llm_model: str = ""
     llm_timeout: float = Field(default=60, gt=0)
+    llm_max_tokens: int = Field(default=4096, ge=1)
+    llm_auth_header: Literal["x-api-key", "authorization"] = "x-api-key"
 
     @classmethod
     def settings_customise_sources(
@@ -91,7 +93,7 @@ class Settings(BaseSettings):
     def validate_services(self) -> Self:
         if self.mysql_enabled and not all((self.mysql_host, self.mysql_user, self.mysql_db)):
             raise ValueError("MySQL requires AGENT_MYSQL_HOST / AGENT_MYSQL_USER / AGENT_MYSQL_DB")
-        if self.llm_provider == "openai_compatible":
+        if self.llm_provider == "anthropic":
             if not all((self.llm_base_url, self.llm_model, self.llm_api_key.get_secret_value())):
                 raise ValueError(
                     "LLM requires AGENT_LLM_BASE_URL / AGENT_LLM_MODEL / AGENT_LLM_API_KEY"

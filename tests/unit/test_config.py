@@ -38,7 +38,7 @@ def test_unknown_environment_rejected(monkeypatch):
 
 
 def test_missing_llm_key_rejected(monkeypatch):
-    monkeypatch.setenv("AGENT_LLM_PROVIDER", "openai_compatible")
+    monkeypatch.setenv("AGENT_LLM_PROVIDER", "anthropic")
     with pytest.raises(ValidationError, match="AGENT_LLM_API_KEY"):
         get_settings()
 

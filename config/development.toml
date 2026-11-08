@@ -6,6 +6,6 @@ cors_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
 mysql_enabled = true
 mysql_user = "mini_agent"
 mysql_db = "mini_agent_dev"
-redis_enabled = false
+redis_enabled = true
 redis_db = 0
 llm_provider = "echo"

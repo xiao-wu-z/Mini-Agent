@@ -4,6 +4,12 @@ from fastapi import Request
 from redis.asyncio import Redis
 
 from server.llm import LLMClient
+from server.tools import ToolRegistry
+
+
+def get_tools(request: Request) -> ToolRegistry:
+    """获取应用工具集合；用户和会话上下文仍由每次 Agent 请求显式提供。"""
+    return request.app.state.tools
 
 
 def get_llm(request: Request) -> LLMClient:

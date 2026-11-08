@@ -1,77 +1,190 @@
-"""OpenAI 兼容协议客户端；供业务层调用，不暴露公共付费调用接口。"""
+"""Anthropic Messages 模型适配层。
+
+职责：
+    - 定义 Message、ToolUse 和 LLMTurn，保留完整 content blocks。
+    - 构造 /v1/messages 请求，提供单轮调用和纯文本 SSE 接口。
+    - 提供无需联网的 echo 模式，便于检查应用入口。
+
+边界：
+    本模块只与模型通信；工具注册、执行和多轮控制分别由 tools、skill_runner、
+    agent_loop 负责。工具调用使用 run_turn，收齐整轮内容后再交给 Loop 执行。
+"""
 
 import json
 from collections.abc import AsyncIterator
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from server.config import Settings
 
+# ============================================================================
+# Anthropic 消息与响应协议
+# ============================================================================
+
 
 class Message(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str
+    """会话中的 user/assistant 消息；system 提示词通过请求顶层字段单独传入。"""
+
+    role: Literal["user", "assistant"]
+    content: str | list[dict[str, Any]]
+
+
+class ToolUse(BaseModel):
+    """模型发起的工具调用，id 用于和后续 tool_result 配对。"""
+
+    type: Literal["tool_use"] = "tool_use"
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    input: dict[str, Any]
+
+
+class LLMTurn(BaseModel):
+    """保留完整 content blocks，包含回灌所需的供应商签名等字段。"""
+
+    content: list[dict[str, Any]]
+    stop_reason: str
+
+    @property
+    def text(self) -> str:
+        """只提取 text 块，不把 thinking 或工具内容当作最终回答。"""
+        return "".join(block["text"] for block in self.content if block.get("type") == "text")
+
+
+# ============================================================================
+# 模型客户端
+# ============================================================================
 
 
 class LLMClient:
+    """复用异步 HTTP 连接的 Anthropic 客户端，由应用生命周期或调用方关闭。"""
+
     def __init__(self, settings: Settings, *, transport: httpx.AsyncBaseTransport | None = None):
         self.settings = settings
+        key = settings.llm_api_key.get_secret_value()
+        headers = {"anthropic-version": "2023-06-01"}
+        headers[settings.llm_auth_header] = (
+            f"Bearer {key}" if settings.llm_auth_header == "authorization" else key
+        )
         self.client = httpx.AsyncClient(
             base_url=(settings.llm_base_url or "http://localhost").rstrip("/") + "/",
-            headers={"Authorization": f"Bearer {settings.llm_api_key.get_secret_value()}"},
+            headers=headers,
             timeout=settings.llm_timeout,
             trust_env=False,
             transport=transport,
         )
+        self.messages_path = (
+            "messages" if self.client.base_url.path.rstrip("/").endswith("/v1") else "v1/messages"
+        )
 
-    async def complete(self, messages: list[Message]) -> str:
+    def _body(
+        self,
+        messages: list[Message],
+        *,
+        system: str,
+        tools: list[dict[str, Any]] | None,
+        stream: bool,
+    ) -> dict[str, Any]:
+        """组装单次请求体；省略未配置的 system 和空工具列表。"""
+        body: dict[str, Any] = {
+            "model": self.settings.llm_model,
+            "max_tokens": self.settings.llm_max_tokens,
+            "messages": [message.model_dump() for message in messages],
+            "stream": stream,
+        }
+        if system:
+            body["system"] = system
+        if tools:
+            body["tools"] = tools
+        return body
+
+    async def run_turn(
+        self,
+        messages: list[Message],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        system: str = "",
+    ) -> LLMTurn:
+        """请求一次完整模型响应，不在客户端内部执行工具或继续循环。
+
+        Args:
+            messages: 当前会话消息，包括前轮 assistant 和对应工具结果。
+            tools: Anthropic 工具声明列表，参数格式为 input_schema。
+            system: 请求顶层的系统提示词，不放入 messages。
+
+        Returns:
+            包含完整 content blocks 和 stop_reason 的 LLMTurn。
+
+        Raises:
+            httpx.HTTPError: 连接失败、超时或接口返回错误状态。
+            ValueError: 响应不是合法 JSON，或缺少必要协议字段。
+        """
         if self.settings.llm_provider == "echo":
-            return self._echo(messages)
+            return LLMTurn(
+                content=[{"type": "text", "text": self._echo(messages)}], stop_reason="end_turn"
+            )
         response = await self.client.post(
-            "chat/completions",
-            json={
-                "model": self.settings.llm_model,
-                "messages": [message.model_dump() for message in messages],
-                "stream": False,
-            },
+            self.messages_path,
+            json=self._body(messages, system=system, tools=tools, stream=False),
         )
         response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"] or ""
+        return LLMTurn.model_validate(response.json())
 
-    async def stream(self, messages: list[Message]) -> AsyncIterator[str]:
+    async def complete(self, messages: list[Message], *, system: str = "") -> str:
+        """发起不带工具的单轮请求，并提取全部 text 块。"""
+        return (await self.run_turn(messages, system=system)).text
+
+    async def stream(self, messages: list[Message], *, system: str = "") -> AsyncIterator[str]:
+        """逐段返回纯文本 SSE 内容，以 message_stop 判断响应完整结束。
+
+        Args:
+            messages: 当前会话消息。
+            system: 请求顶层的系统提示词。
+
+        Yields:
+            content_block_delta 事件中的 text_delta 文本。
+
+        Raises:
+            httpx.HTTPError: 请求失败或读取超时。
+            RuntimeError: 服务端报告流错误，或连接在 message_stop 前结束。
+        """
         if self.settings.llm_provider == "echo":
             yield self._echo(messages)
             return
         async with self.client.stream(
             "POST",
-            "chat/completions",
-            json={
-                "model": self.settings.llm_model,
-                "messages": [message.model_dump() for message in messages],
-                "stream": True,
-            },
+            self.messages_path,
+            json=self._body(messages, system=system, tools=None, stream=True),
         ) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    return
-                if not data:
+                if not line.startswith("data:") or not (data := line[5:].strip()):
                     continue
                 event = json.loads(data)
-                if "error" in event:
+                if event.get("type") == "error":
                     raise RuntimeError("LLM provider returned a stream error")
-                choices = event.get("choices", [])
-                if choices and (content := choices[0].get("delta", {}).get("content")):
-                    yield content
+                if event.get("type") == "message_stop":
+                    return
+                delta = event.get("delta", {})
+                if event.get("type") == "content_block_delta" and delta.get("type") == "text_delta":
+                    yield delta["text"]
+        raise RuntimeError("LLM stream ended before message_stop")
 
     @staticmethod
     def _echo(messages: list[Message]) -> str:
-        return next((item.content for item in reversed(messages) if item.role == "user"), "")
+        """返回最近的用户文本，跳过仅包含 tool_result 的回灌消息。"""
+        for message in reversed(messages):
+            if message.role == "user":
+                if isinstance(message.content, str):
+                    return message.content
+                text = "".join(
+                    block["text"] for block in message.content if block.get("type") == "text"
+                )
+                if text:
+                    return text
+        return ""
 
     async def close(self) -> None:
+        """关闭 HTTP 连接池，释放客户端资源。"""
         await self.client.aclose()

@@ -17,7 +17,9 @@ from server.conversations import ConversationService
 from server.llm import LLMTurn
 from server.store.sessions import MessageModel, SessionModel, SessionStore
 from server.store.todos import TodoModel, TodoStore
+from server.store.tool_results import ToolResultModel, ToolResultStore
 from server.tools import create_default_tools
+from skills._shared.context import ToolContext
 
 MYSQL_VARIABLE = "MINI_AGENT_TEST_MYSQL_URL"
 REDIS_VARIABLE = "MINI_AGENT_TEST_REDIS_URL"
@@ -53,14 +55,13 @@ async def test_mysql_redis_session_history(monkeypatch):
         first = await store.create(user_id, "天气")
         second = await store.create(user_id, "周报")
         ids.extend([first.id, second.id])
-        service = ConversationService(store, cache, loop, timeout_seconds=120, recent_turns=12)
+        service = ConversationService(store, cache, loop, timeout_seconds=120)
         await service.chat(user_id, first.id, "我叫小明")
         restored = ConversationService(
             SessionStore(factory),
             SessionCache(redis, ttl_seconds=300),
             loop,
             timeout_seconds=120,
-            recent_turns=12,
         )
         await restored.chat(user_id, first.id, "我叫什么")
         assert model.requests[-1][0].content == "我叫小明"
@@ -89,9 +90,7 @@ async def test_mysql_redis_session_history(monkeypatch):
                 return turns.popleft()
 
         task_loop = AgentLoop(TaskModel(), create_default_tools(todo_store=TodoStore(factory)))
-        task_service = ConversationService(
-            store, cache, task_loop, timeout_seconds=120, recent_turns=12
-        )
+        task_service = ConversationService(store, cache, task_loop, timeout_seconds=120)
         original = TodoStore.create
 
         async def write_then_crash(self, **kwargs):
@@ -103,7 +102,7 @@ async def test_mysql_redis_session_history(monkeypatch):
             await task_service.chat(user_id, first.id, "新增待办")
         monkeypatch.setattr(TodoStore, "create", original)
         restored_task_service = ConversationService(
-            SessionStore(factory), cache, task_loop, timeout_seconds=120, recent_turns=12
+            SessionStore(factory), cache, task_loop, timeout_seconds=120
         )
         result = await restored_task_service.chat(user_id, first.id, "继续", action="continue")
         assert result.task_status == "completed"
@@ -112,9 +111,30 @@ async def test_mysql_redis_session_history(monkeypatch):
         )
         assert len(items) == 1
         assert (await store.load_task(user_id, first.id))["history_saved"] is True
+        # 引用原文独立落库；缓存丢失和新 Store 实例均不能使读取失效。
+        result_store = ToolResultStore(factory, redis=redis, cache_ttl_seconds=300)
+        ref = uuid4().hex
+        context = ToolContext(user_id=user_id, session_id=first.id)
+        original_result = {
+            "type": "tool_result",
+            "tool_use_id": "large-call",
+            "content": "原文" * 6000,
+        }
+        await result_store.put(ref, original_result, context=context)
+        key = f"{cache.scope_key(user_id, first.id)}:result:{ref}"
+        await redis.delete(key)
+        restored_results = ToolResultStore(factory, redis=redis, cache_ttl_seconds=300)
+        assert await restored_results.get(ref, context=context) == original_result
+        assert (
+            await restored_results.get(
+                ref, context=ToolContext(user_id=user_id, session_id=second.id)
+            )
+            is None
+        )
 
     finally:
         async with factory() as session, session.begin():
+            await session.execute(delete(ToolResultModel).where(ToolResultModel.user_id == user_id))
             await session.execute(delete(TodoModel).where(TodoModel.user_id == user_id))
             await session.execute(delete(MessageModel).where(MessageModel.session_id.in_(ids)))
             await session.execute(delete(SessionModel).where(SessionModel.id.in_(ids)))

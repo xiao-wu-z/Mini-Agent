@@ -73,6 +73,7 @@ class SessionModel(Base):
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     # 检查点可能包含未配对的协议块，只在任务恢复时使用，不作为公开消息历史。
     task_state: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    context_state: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
 
@@ -212,6 +213,7 @@ class SessionStore:
         *,
         expected_version: int,
         task_state: dict[str, Any] | None = None,
+        context_state: dict[str, Any] | None = None,
     ) -> None:
         """原子提交整轮消息与可选任务检查点，避免存入未配对的工具消息。
 
@@ -240,6 +242,14 @@ class SessionStore:
             owner.updated_at = utc_now()
             if task_state is not None:
                 owner.task_state = task_state
+            if context_state is not None:
+                owner.context_state = context_state
+
+    async def load_context(self, user_id: str, session_id: str) -> dict[str, Any] | None:
+        """读取已提交历史对应的摘要与结果视图，归属校验与历史读取一致。"""
+        async with self.session_factory() as session:
+            owner = await self._session(session, user_id, session_id)
+            return owner.context_state
 
     async def load_task(self, user_id: str, session_id: str) -> dict[str, Any] | None:
         """校验会话归属后读取当前任务；尚无任务时返回 None。"""

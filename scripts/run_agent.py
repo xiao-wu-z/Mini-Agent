@@ -22,6 +22,7 @@ from server.llm import LLMClient
 from server.store._db import Database
 from server.store.sessions import SessionStore
 from server.store.todos import TodoStore
+from server.store.tool_results import ToolResultStore
 from server.tools import create_default_tools
 from skills._shared.context import ToolContext
 
@@ -58,7 +59,19 @@ async def main() -> None:
         if database is not None:
             stack.push_async_callback(database.close)
         todo_store = TodoStore(database.session_factory) if database is not None else None
-        tools = create_default_tools(todo_store=todo_store)
+        redis = create_redis(settings) if settings.redis_enabled else None
+        if redis is not None:
+            stack.push_async_callback(redis.aclose)
+        result_store = (
+            ToolResultStore(
+                database.session_factory,
+                redis=redis,
+                cache_ttl_seconds=settings.tool_result.cache_ttl_seconds,
+            )
+            if database is not None and not arguments.stateless
+            else None
+        )
+        tools = create_default_tools(todo_store=todo_store, result_store=result_store)
         loop = AgentLoop(
             client,
             tools,
@@ -67,6 +80,9 @@ async def main() -> None:
             request_max_tokens=settings.request_max_tokens,
             max_output_tokens=min(settings.request_max_output_tokens, settings.llm_max_tokens),
             token_margin=settings.token_safety_margin,
+            context_policy=settings.context,
+            result_policy=settings.tool_result,
+            result_store=result_store,
         )
         if arguments.stateless:
             context = ToolContext(
@@ -75,8 +91,6 @@ async def main() -> None:
             result = await loop.run(arguments.message, context=context)
             session_id = context.session_id
         else:
-            redis = create_redis(settings)
-            stack.push_async_callback(redis.aclose)
             store = SessionStore(database.session_factory)
             if arguments.session_id is None:
                 info = await store.create(arguments.user_id, arguments.session_title)
@@ -92,7 +106,6 @@ async def main() -> None:
                 ),
                 loop,
                 timeout_seconds=settings.agent_run_timeout_seconds,
-                recent_turns=settings.context_recent_turns,
             )
             result = await service.chat(
                 arguments.user_id,

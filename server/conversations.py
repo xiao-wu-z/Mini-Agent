@@ -15,12 +15,14 @@
 
 import asyncio
 import logging
+import time
+from uuid import uuid4
 
 from pydantic import BaseModel
 
 from server.agent_loop import AgentLoop, TaskState, ToolTrace
 from server.cache import SessionCache
-from server.context import build_context
+from server.context import ContextState
 from server.llm import Message
 from server.store.sessions import ConversationCode, ConversationError, SessionStore
 from skills._shared.context import ToolContext
@@ -57,13 +59,11 @@ class ConversationService:
         loop: AgentLoop,
         *,
         timeout_seconds: float,
-        recent_turns: int,
     ):
         self.store = store
         self.cache = cache
         self.loop = loop
         self.timeout_seconds = timeout_seconds
-        self.recent_turns = recent_turns
         self._locks: dict[str, asyncio.Lock] = {}
 
     async def history(self, user_id: str, session_id: str) -> list[Message]:
@@ -140,6 +140,10 @@ class ConversationService:
             if task is None:
                 raise ConversationError(ConversationCode.TASK_NOT_FOUND, "没有当前任务。")
             task.status, task.reason = "cancelled", "user_cancelled"
+            task.checkpoint.phase = "cancelled"
+            task.checkpoint.id = uuid4().hex
+            task.checkpoint.version += 1
+            task.checkpoint.updated_at = time.time()
             await self.store.save_task(
                 user_id, session_id, task.model_dump(mode="json"), expected_version=info.version
             )
@@ -196,14 +200,10 @@ class ConversationService:
                 )
             for operation_id in confirmed_not_executed:
                 unknown[operation_id].status = "pending"
-        # ---- 4. 新任务裁剪已提交历史，恢复任务直接使用完整检查点 ----
-        history = (
-            []
-            if continuing
-            else build_context(
-                await self.history(user_id, session_id), recent_turns=self.recent_turns
-            )
-        )
+        # ---- 4. 原文完整加载；模型工作视图由 Loop 按持久化摘要边界生成 ----
+        history = [] if continuing else await self.history(user_id, session_id)
+        raw_context = await self.store.load_context(user_id, session_id)
+        context_state = ContextState.model_validate(raw_context or {})
 
         async def checkpoint(state: TaskState) -> None:
             """独立短事务保存进度；不在模型和工具执行期间持有数据库事务。"""
@@ -220,6 +220,7 @@ class ConversationService:
                     context=ToolContext(user_id=user_id, session_id=session_id),
                     state=task if continuing else None,
                     checkpoint=checkpoint,
+                    context_state=context_state,
                 )
         except asyncio.CancelledError:
             raise
@@ -255,9 +256,10 @@ class ConversationService:
             user_id,
             session_id,
             task.task_id,
-            task.messages[task.history_size :],
+            task.task_messages,
             expected_version=version,
             task_state=task.model_dump(mode="json"),
+            context_state=task.context_state.model_dump(mode="json"),
         )
 
     async def task(self, user_id: str, session_id: str) -> dict:
@@ -283,6 +285,16 @@ class ConversationService:
             "reason": "interrupted" if interrupted else task.reason,
             "total_tokens": task.total_tokens,
             "request_tokens": task.request_tokens,
+            "usage_estimated": task.usage_estimated,
+            "checkpoint": task.checkpoint.model_dump(),
+            "context": {
+                "summary_version": task.context_state.version,
+                "summary_start_sequence": task.context_state.start + 1
+                if task.context_state.summary
+                else None,
+                "summary_until_sequence": task.context_state.end,
+                "large_result_count": len(task.context_state.result_views),
+            },
             "operations": [
                 {"operation_id": op.id, "tool": op.call.name, "status": op.status}
                 for op in task.operations

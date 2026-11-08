@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Self
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -23,6 +23,33 @@ DEFAULT_TOKEN_MARGIN = 256
 DEFAULT_TOOL_TIMEOUT_SECONDS = 10
 
 
+class ContextPolicy(BaseModel):
+    """上下文容量与首尾保留策略；阈值基于预留输出后的可用输入容量。"""
+
+    window_tokens: int = Field(default=32000, ge=1)
+    keep_head_units: int = Field(default=2, ge=1)
+    keep_tail_units: int = Field(default=6, ge=1)
+    soft_ratio: float = Field(default=0.70, gt=0, lt=1)
+    hard_ratio: float = Field(default=0.85, gt=0, lt=1)
+    summary_max_tokens: int = Field(default=1024, ge=1)
+    min_interval_seconds: float = Field(default=60, ge=0)
+
+    @model_validator(mode="after")
+    def validate_thresholds(self) -> Self:
+        """硬阈值必须高于软阈值，避免频次控制掩盖必须执行的压缩。"""
+        if self.soft_ratio >= self.hard_ratio:
+            raise ValueError("context soft_ratio must be below hard_ratio")
+        return self
+
+
+class ToolResultPolicy(BaseModel):
+    """大结果外置与分页读取限制；字符分页与 UTF-8 字节阈值分别计量。"""
+
+    inline_max_bytes: int = Field(default=8192, ge=1)
+    preview_chars: int = Field(default=256, ge=0)
+    cache_ttl_seconds: int = Field(default=3600, ge=1)
+
+
 def selected_environment() -> Environment:
     value = os.environ.get("APP_ENV", "development")
     if value not in {"development", "testing", "production"}:
@@ -37,6 +64,7 @@ class Settings(BaseSettings):
         extra="ignore",
         populate_by_name=True,
         hide_input_in_errors=True,
+        env_nested_delimiter="__",
     )
 
     app_env: Environment = Field(default="development", validation_alias="APP_ENV")
@@ -81,7 +109,8 @@ class Settings(BaseSettings):
     token_safety_margin: int = Field(default=DEFAULT_TOKEN_MARGIN, ge=0)
     llm_auth_header: Literal["x-api-key", "authorization"] = "x-api-key"
 
-    context_recent_turns: int = Field(default=12, ge=1)
+    context: ContextPolicy = Field(default_factory=ContextPolicy)
+    tool_result: ToolResultPolicy = Field(default_factory=ToolResultPolicy)
     session_cache_ttl_seconds: int = Field(default=300, ge=1)
     agent_run_timeout_seconds: float = Field(default=120, gt=0)
     api_token: SecretStr = SecretStr("")

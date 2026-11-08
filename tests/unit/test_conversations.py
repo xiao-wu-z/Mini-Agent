@@ -13,7 +13,7 @@ from server.agent_loop import AgentLoop
 from server.app import create_app
 from server.cache import SessionCache
 from server.config import get_settings
-from server.context import build_context
+from server.context import message_units
 from server.conversations import ConversationService
 from server.llm import LLMTurn
 from server.store.base import Base
@@ -49,7 +49,7 @@ async def conversation(tmp_path):
     cache = SessionCache(redis, ttl_seconds=300)
     model = TestModel()
     loop = AgentLoop(model, create_default_tools(todo_store=TodoStore(store.session_factory)))
-    service = ConversationService(store, cache, loop, timeout_seconds=120, recent_turns=2)
+    service = ConversationService(store, cache, loop, timeout_seconds=120)
     yield service, model, redis
     await redis.aclose()
     await engine.dispose()
@@ -80,7 +80,6 @@ async def test_cache_and_service_recreation(conversation):
         service.cache,
         service.loop,
         timeout_seconds=120,
-        recent_turns=2,
     )
     await restored.chat("a", info.id, "继续")
     assert model.requests[-1][0].content == "之前的状态"
@@ -126,12 +125,11 @@ async def test_context_keeps_complete_tool_rounds(conversation):
         user_id="a", session_id=info.id, status=None, limit=10, offset=0
     )
     assert items[0].title == "带伞"
-    selected = build_context(history, recent_turns=1)
-    assert len(selected) == 4
+    assert message_units(history) == [(0, 1), (1, 3), (3, 4)]
     await service.chat("a", info.id, "下一轮")
     await service.chat("a", info.id, "第三轮")
     await service.chat("a", info.id, "第四轮")
-    assert model.requests[-1][0].content == "下一轮"
+    assert model.requests[-1][0].content == "记待办带伞"
     assert len(await service.history("a", info.id)) == 10
 
 
@@ -240,9 +238,7 @@ async def test_todo_write_then_crash_resumes_without_duplicate(conversation, mon
     with pytest.raises(ConversationError):
         await service.chat("a", info.id, "新任务不能覆盖")
     monkeypatch.setattr(TodoStore, "create", original)
-    restored = ConversationService(
-        service.store, service.cache, service.loop, timeout_seconds=120, recent_turns=2
-    )
+    restored = ConversationService(service.store, service.cache, service.loop, timeout_seconds=120)
     result = await restored.chat("a", info.id, "继续", action="continue")
     assert result.task_status == "completed"
     assert result.turn_id == checkpoint["task_id"]
@@ -358,3 +354,65 @@ async def test_unknown_write_requires_explicit_confirmation_before_retry(convers
     )
     assert completed.task_status == "completed"
     assert attempts == [operation_id, operation_id]
+
+
+async def test_compression_commits_original_history_and_summary_atomically(
+    conversation, monkeypatch
+):
+    import json
+
+    from server.config import ContextPolicy
+    from server.llm import Message, TokenUsage
+
+    service, model, _ = conversation
+    info = await service.store.create("a", "压缩窗口")
+    source = [
+        Message(role="user" if index % 2 == 0 else "assistant", content=f"{index}:" + "资料" * 100)
+        for index in range(10)
+    ]
+    await service.store.save_turn("a", info.id, "old-task", source, expected_version=0)
+    service.loop.context_policy = ContextPolicy(
+        window_tokens=2400,
+        keep_head_units=2,
+        keep_tail_units=2,
+        summary_max_tokens=64,
+        min_interval_seconds=0,
+    )
+    service.loop.max_output_tokens = 64
+    service.loop.token_margin = 0
+
+    async def count(messages, *, tools, system):
+        return len(json.dumps([m.model_dump() for m in messages], ensure_ascii=False)) + len(system)
+
+    monkeypatch.setattr(model, "count_tokens", count, raising=False)
+    model.turns.extend(
+        [
+            LLMTurn(
+                content=[{"type": "text", "text": "事实摘要"}],
+                stop_reason="end_turn",
+                usage=TokenUsage(input_tokens=10, output_tokens=2),
+            ),
+            LLMTurn(
+                content=[{"type": "text", "text": "新答案"}],
+                stop_reason="end_turn",
+                usage=TokenUsage(input_tokens=10, output_tokens=2),
+            ),
+        ]
+    )
+    reply = await service.chat("a", info.id, "新问题")
+    assert reply.rounds == 2
+    saved = await service.history("a", info.id)
+    assert len(saved) == 12 and saved[:10] == source
+    assert saved[10].content == "新问题"
+    assert all("事实摘要" not in str(message.content) for message in saved)
+    snapshot = await service.store.load_task("a", info.id)
+    context = await service.store.load_context("a", info.id)
+    assert snapshot["history_saved"] and context == snapshot["context_state"]
+    assert context["summary"] == "事实摘要"
+    assert 0 < context["end"] <= 10
+    restored = ConversationService(service.store, service.cache, service.loop, timeout_seconds=120)
+    before = len(model.requests)
+    await restored.chat("a", info.id, "追问")
+    assert len(model.requests) == before + 1
+    assert "事实摘要" in model.requests[-1][2].content
+    assert len(await restored.history("a", info.id)) == 14

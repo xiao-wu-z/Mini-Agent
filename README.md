@@ -173,6 +173,7 @@ Redis 客户端由应用 lifespan 创建并在退出时关闭。
 | search | query、limit | 搜索固定资料集；返回 `is_mock=true` 和 `mock://` 来源 |
 | weather | city、day | 五座城市今天/明天的固定模拟天气，返回 `is_mock=true` |
 | todo | action、title、todo_id、status、limit、offset | MySQL 持久化待办，按用户和会话隔离 |
+| read_tool_result | ref、offset、limit | 分页读取当前会话的结果原文，默认 1024、最多 2048 字符 |
 
 `weather` 支持北京、上海、杭州、深圳、广州，`day` 为 `today` / `tomorrow`。
 Mock 数据用于验证工具闭环，不可作为实际天气预报或实时网络搜索结果。
@@ -316,13 +317,59 @@ CLI 对应 `--continue-task --retry-operation '<operation_id>'`，不会自动�
 MySQL 保存完整历史，Redis 缓存历史读取结果；缓存丢失或不可用时回源 MySQL，聊天仍可继续。
 缓存按消息数量水位区分版本，避免旧读取覆盖新历史。
 
-`server/context.py` 只保留最近若干完整对话轮，默认 12 轮，通过
-`AGENT_CONTEXT_RECENT_TURNS` 调整。tool_use 和对应 tool_result 不拆散。
-系统提示词和工具 Schema 每次单独组装，不重复保存。
-原始历史不删除；当前不做向量检索和语义摘要，超出窗口的事实不会自动进入本轮 context。
+### Context 压缩与结果引用
 
-成功的一轮消息在短事务中一次性保存，不保存未配对的工具块到公开历史。
-未完成进度保存在当前任务检查点，续执行不依赖最近 12 轮历史能否覆盖原任务。
+模型输入采用“开头原文 + 中段滚动摘要 + 最近原文”，当前任务的未完成工具交互不参与压缩。
+首尾按安全消息单元保留：普通消息是一个单元，含多个 tool_use 的完整 assistant 与紧邻的
+整批 tool_result 合为一个单元。两侧切点均校验 ID，无孤立结果、缺失结果或重复 ID；
+保留区的 thinking/signature 原样回灌，摘要模型不接收这些内部推理字段。
+当前任务目标被摘要覆盖时，会在工作视图中额外保留其用户原文。
+
+每次主模型调用前计算 system、工具 Schema、摘要和消息的总输入量；预留输出与安全余量后，
+达到软阈值可同步压缩，达到硬阈值必须压缩。首尾不足以提供安全中段、摘要失败或压缩无效时，
+硬阈值下暂停，保留旧状态，不硬截参数或结果。软阈值下压缩失败可继续使用容量允许的旧视图。
+摘要输入过长时按完整单元分批；每次合并旧摘要与新增中段，所有摘要调用共享请求预算、
+模型请求次数和总超时。没有后台压缩或额外隐藏的收尾请求。
+
+配置支持嵌套环境变量（双下划线），默认值如下：
+
+```dotenv
+AGENT_CONTEXT__WINDOW_TOKENS=32000
+AGENT_CONTEXT__KEEP_HEAD_UNITS=2
+AGENT_CONTEXT__KEEP_TAIL_UNITS=6
+AGENT_CONTEXT__SOFT_RATIO=0.70
+AGENT_CONTEXT__HARD_RATIO=0.85
+AGENT_CONTEXT__SUMMARY_MAX_TOKENS=1024
+AGENT_CONTEXT__MIN_INTERVAL_SECONDS=60
+AGENT_TOOL_RESULT__INLINE_MAX_BYTES=8192
+AGENT_TOOL_RESULT__PREVIEW_CHARS=256
+AGENT_TOOL_RESULT__CACHE_TTL_SECONDS=3600
+```
+
+WINDOW_TOKENS 按实际部署模型设置，不由模型名猜测。默认输出预留为 4096 Token，
+软硬比例基于扣除输出预留与安全余量后的输入容量。原 `AGENT_CONTEXT_RECENT_TURNS` 已移除。
+
+大结果先完整保存到 `agent_tool_result`，然后工作视图中的 tool_result 保留原调用 ID、
+错误标识，content 换成 ref、大小、明确标记不完整的预览和读取提示。
+`read_tool_result(ref, offset, limit)` 按 Unicode 字符分页，返回 next_offset、has_more 与
+original_is_error；有界读取不再被外置成新指针。原始参数与结果仍完整保存在消息历史中。
+
+Redis 只缓存读取结果，丢失或不可用时回源 MySQL。ref 与用户、Session 绑定，不能跨窗口读取；
+引用原文独立于当前 checkpoint，取消或新建任务不会使旧 ref 失效。
+结果不存在时返回 NOT_FOUND，Loop 暂停等待用户处理，不继续让模型自动重跑原工具。
+未配置持久化的 stateless 模式遇到大结果会暂停，
+不会向模型发布失效引用。当前原文没有自动清理策略，不依赖 Redis TTL 维持恢复能力。
+
+`agent_session.context_state` 保存摘要、覆盖边界与大结果视图；内部使用零起始右开区间，
+查询任务时转换为原始消息的 sequence 覆盖范围，
+已提交历史与未提交任务使用同一追加序列。`task_state` 保存完整原文和当前任务独立原文，
+生成模型工作视图不会修改它们。任务完成时，原始消息、摘要状态和 history_saved 原子提交。
+checkpoint 元信息包括 id、version、phase、updated_at，只保留最新恢复点；恢复原样沿用摘要、
+操作 ID 和失败记录。进程在大结果落库后、检查点更新前退出时，可按稳定操作 ID 找回结果，
+无需重新执行工具。原文尚未落库的未知写操作仍需核实。
+
+成功的一轮消息在短事务中一次性保存，未配对工具块只存在于任务检查点。
+完整原始历史不删除，不依赖向量库；语义摘要可能丢失细节，不能代替工具执行状态或精确原文。
 同窗口在单应用进程内用 asyncio.Lock 避免并发；基础版本使用单 worker 部署。
 此锁不提供跨进程互斥，不宣称写工具具有跨进程 exactly-once 保证。
 
@@ -420,18 +467,19 @@ server/
   conversations.py         # 读取历史、调用 Loop、保存整轮消息
   config.py                # 配置加载、校验与 SecretStr
   dependencies.py          # LLM、Redis 路由依赖
-  context.py               # 最近完整对话轮的组装
+  context.py               # 工具安全单元、首尾视图与滚动摘要边界
   cache.py                 # Redis 历史缓存和客户端
   llm.py                   # Anthropic 客户端与 Message、LLMTurn、ToolUse
   agent_loop.py            # 自研 while 循环和工具执行 trace
-  tools.py                 # 四个工具定义、注册表、默认注册
+  tools.py                 # 五个工具定义、注册表、默认注册
   skill_runner.py          # 参数校验、工具执行、超时、错误回灌
   routes/health.py         # 存活和就绪探针
   store/
     _db.py                 # MySQL 连接池与 session 依赖
     base.py                # ORM 基类
     todos.py               # 待办模型与作用域隔离的持久化访问
-    sessions.py            # 会话和消息实体及短事务访问
+    sessions.py            # 会话、原始消息与摘要状态的短事务访问
+    tool_results.py        # 独立结果原文和 Redis 读取缓存
 migrations/                # Alembic 迁移环境及版本目录
 skills/
   _shared/                 # 可信工具上下文和业务错误
@@ -440,6 +488,7 @@ skills/
   search/handler.py        # Mock 资料搜索
   todo/handler.py          # 待办增删改查
   weather/handler.py       # Mock 天气
+  read_tool_result/handler.py # 结果引用的有界分页读取
 tests/
   conftest.py              # 测试环境隔离
   unit/                    # Loop、LLM、配置、健康检查、生命周期测试

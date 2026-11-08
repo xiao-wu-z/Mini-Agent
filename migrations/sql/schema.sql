@@ -1,5 +1,4 @@
 -- Mini Agent current schema (MySQL 8.4)
--- Current tables use mt-agent conversation/message names.
 -- Existing databases must use Alembic migrations; legacy archives are excluded.
 
 CREATE TABLE agent_session (
@@ -7,6 +6,7 @@ CREATE TABLE agent_session (
     user_id VARCHAR(64) NOT NULL,
     title VARCHAR(200) NOT NULL,
     version INTEGER NOT NULL,
+    task_state JSON,
     created_at DATETIME NOT NULL,
     updated_at DATETIME NOT NULL,
     CONSTRAINT pk_agent_session PRIMARY KEY (id)

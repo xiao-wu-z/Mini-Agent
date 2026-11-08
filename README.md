@@ -236,14 +236,16 @@ followup = await loop.run("再除以 2", history=first.messages, context=context
 ```
 
 全部 handler 接收 `(arguments, context)`。上下文中的用户和 Session ID 由调用方提供，
-Loop 为每次执行补充 run_id / tool_use_id，模型不能通过业务参数改变归属。
+Loop 为执行补充 run_id / tool_use_id / operation_id，模型不能通过业务参数改变归属。
 未提供身份或未注入数据库时，Todo 返回明确错误，不退化为内存待办。
-新增调用使用运行和工具调用标识去重；这不代表同一自然语言请求跨 Run 自动去重。
+Todo 创建使用稳定 operation_id 去重；直接调用 handler 未提供该标识时使用运行和工具调用标识。
+这不代表同一自然语言请求跨任务自动去重。
 在应用路由中可以通过 `Depends(server.dependencies.get_tools)` 获取已装配的工具集合。
 
 直接调用 Loop 时通过 `history` 显式接续；HTTP 和默认 CLI 使用 ConversationService 自动持久化历史。
 默认最多调用模型 8 轮；同一轮的多工具按顺序执行并集中回灌。工具执行超时、未知工具、
-参数不合法及执行异常均转为 `is_error=true` 的结果，供模型修正。
+参数不合法及执行异常均转为 `is_error=true` 的结果。只读工具错误回灌模型修正；
+写工具超时或普通执行异常按结果未知暂停，先核实副作用。
 达到轮次上限返回 `max_rounds`；模型输出截断返回 `max_tokens`，不会执行截断响应中的工具。
 LLM 网络错误、协议错误向调用方抛出；任务取消会继续传播，不会伪装成普通工具失败。
 
@@ -252,6 +254,60 @@ LLM 网络错误、协议错误向调用方抛出；任务取消会继续传播�
 日志记录工具名称、调用 ID、耗时及错误状态，不输出模型内部推理或工具参数。
 
 ## 会话与对话历史
+
+### 请求预算、纠错与任务恢复
+
+一个 Session 同时保留一个当前任务，检查点存于 `agent_session.task_state` JSON。
+任务可以跨多次用户请求；每次请求重新分配预算，任务累计用量和错误记录继续保留。
+已有未完成任务时，新任务请求返回 409，必须显式继续或取消，不能静默覆盖。
+
+```dotenv
+AGENT_REQUEST_MAX_TOKENS=64000
+AGENT_REQUEST_MAX_OUTPUT_TOKENS=4096
+AGENT_REQUEST_MAX_STEPS=8
+AGENT_TOKEN_SAFETY_MARGIN=256
+AGENT_AGENT_TOOL_TIMEOUT_SECONDS=10
+AGENT_LLM_COUNT_TOKENS=true
+```
+
+请求总预算累计每次模型调用的输入和输出，含重复输入、缓存输入以及复盘调用。
+调用前预留输入与输出预算，响应后按 usage 结算。优先使用供应商 count_tokens；
+不支持计数接口时用 UTF-8 请求字节数保守估算，未知 usage 或中断调用保留预留消耗，
+通过 `usage_estimated` 标识。供应商估算偏差无法提供绝对零超支保证；预算不足不再请求模型。
+单次输出受请求剩余额度及 `AGENT_LLM_MAX_TOKENS` 同时限制。
+
+同错按工具、动作、错误码和字段约束累计：第 2 次追加纠错提示，第 3 次调用当前模型
+做一次结构化复盘，第 4 次仍失败则暂停。复盘与主决策共享 token、步骤和超时预算，
+每个错误簇最多尝试一次；格式错误使用明确反馈，不追加隐藏模型调用。
+复盘可以要求用户补充信息。同工具动作成功后关闭相应错误记录，无关工具成功不会清零。
+
+运行状态包括 running、paused、waiting_user、completed、cancelled。
+预算耗尽、轮次上限、输出截断和同错熔断均暂停任务，不表示任务完成。
+普通模型 end_turn 表示本次任务执行结束，不提供独立的语义完成验证。
+
+工具执行前保存稳定 operation_id 和 unknown 状态，执行后保存结果；已完成操作不重复执行。
+Todo 创建用 operation_id 去重，完成操作可重复确认，删除恢复会明确区分“已不存在”与“本次删除”。
+只有声明为 retry_safe 的工具可以恢复未知调用；其他写工具的未知结果需要先核实，不能直接重放。
+模型失败、超时、用户断开或进程重启后可从检查点继续；持久化数据库不可用时不承诺最新步骤已保存。
+
+```bash
+# 创建任务（记录打印的 session_id）
+uv run python -m scripts.run_agent '查杭州天气并记待办'
+# 同一任务继续或补充信息
+uv run python -m scripts.run_agent --session-id '<ID>' --continue-task '补充信息或继续'
+# 显式取消后可以创建新任务
+uv run python -m scripts.run_agent --session-id '<ID>' --cancel-task '取消'
+```
+
+HTTP 使用 `POST /sessions/{id}/chat`：新任务 body 为 `{"message":"目标"}`，
+继续为 `{"action":"continue","message":"补充信息或继续"}`，取消为 `{"action":"cancel"}`。取消只停止后续执行，不撤销已经完成的工具操作。
+通过 `GET /sessions/{id}/task` 查询目标、状态、用量和操作状态，不暴露原始推理或检查点消息。
+若写操作结果为 unknown，先核实外部系统；仅在确认未执行后，继续请求可传
+`"confirmed_not_executed":["<operation_id>"]` 明确允许重试该操作。
+CLI 对应 `--continue-task --retry-operation '<operation_id>'`，不会自动重放结果未知的写操作。
+成功任务的完整消息一次性提交到历史；暂停任务的未配对工具块只保存在检查点，恢复配对后再调用模型。
+完成检查点与历史提交之间中断时，下次请求先补提交历史，不重复执行模型或工具。
+当前仍按单 worker 部署，不提供跨进程调度或所有外部服务的 exactly-once 保证。
 
 参考 mt-agent 的基本链路：校验会话归属 → 读取历史 → 组装 context → 执行 Loop → 保存整轮消息。
 
@@ -265,8 +321,8 @@ MySQL 保存完整历史，Redis 缓存历史读取结果；缓存丢失或不�
 系统提示词和工具 Schema 每次单独组装，不重复保存。
 原始历史不删除；当前不做向量检索和语义摘要，超出窗口的事实不会自动进入本轮 context。
 
-成功的一轮消息在短事务中一次性保存，不保存未配对的工具块。失败不自动重试写工具，
-也不保存不完整的本轮消息；工具可能已经产生副作用，重试前应先查询业务状态。
+成功的一轮消息在短事务中一次性保存，不保存未配对的工具块到公开历史。
+未完成进度保存在当前任务检查点，续执行不依赖最近 12 轮历史能否覆盖原任务。
 同窗口在单应用进程内用 asyncio.Lock 避免并发；基础版本使用单 worker 部署。
 此锁不提供跨进程互斥，不宣称写工具具有跨进程 exactly-once 保证。
 

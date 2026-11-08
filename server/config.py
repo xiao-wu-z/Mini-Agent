@@ -16,6 +16,11 @@ from sqlalchemy import URL
 
 ROOT = Path(__file__).resolve().parent.parent
 Environment = Literal["development", "testing", "production"]
+DEFAULT_REQUEST_MAX_TOKENS = 64000
+DEFAULT_MAX_OUTPUT_TOKENS = 4096
+DEFAULT_MAX_STEPS = 8
+DEFAULT_TOKEN_MARGIN = 256
+DEFAULT_TOOL_TIMEOUT_SECONDS = 10
 
 
 def selected_environment() -> Environment:
@@ -68,6 +73,12 @@ class Settings(BaseSettings):
     llm_model: str = ""
     llm_timeout: float = Field(default=60, gt=0)
     llm_max_tokens: int = Field(default=4096, ge=1)
+    llm_count_tokens: bool = True
+    request_max_tokens: int = Field(default=DEFAULT_REQUEST_MAX_TOKENS, ge=1)
+    request_max_output_tokens: int = Field(default=DEFAULT_MAX_OUTPUT_TOKENS, ge=1)
+    agent_tool_timeout_seconds: float = Field(default=DEFAULT_TOOL_TIMEOUT_SECONDS, gt=0)
+    request_max_steps: int = Field(default=DEFAULT_MAX_STEPS, ge=1)
+    token_safety_margin: int = Field(default=DEFAULT_TOKEN_MARGIN, ge=0)
     llm_auth_header: Literal["x-api-key", "authorization"] = "x-api-key"
 
     context_recent_turns: int = Field(default=12, ge=1)

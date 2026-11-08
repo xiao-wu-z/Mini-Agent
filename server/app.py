@@ -53,7 +53,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         app.state.redis,
                         ttl_seconds=settings.session_cache_ttl_seconds,
                     ),
-                    AgentLoop(app.state.llm, app.state.tools),
+                    AgentLoop(
+                        app.state.llm,
+                        app.state.tools,
+                        max_rounds=settings.request_max_steps,
+                        tool_timeout=settings.agent_tool_timeout_seconds,
+                        request_max_tokens=settings.request_max_tokens,
+                        max_output_tokens=min(
+                            settings.request_max_output_tokens, settings.llm_max_tokens
+                        ),
+                        token_margin=settings.token_safety_margin,
+                    ),
                     timeout_seconds=settings.agent_run_timeout_seconds,
                     recent_turns=settings.context_recent_turns,
                 )
@@ -82,7 +92,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def conversation_error(request: Request, exc: ConversationError) -> JSONResponse:
         if exc.code == ConversationCode.SESSION_NOT_FOUND:
             code = status.HTTP_404_NOT_FOUND
-        elif exc.code == ConversationCode.SESSION_BUSY:
+        elif exc.code in {
+            ConversationCode.SESSION_BUSY,
+            ConversationCode.TASK_PENDING,
+            ConversationCode.TASK_NOT_FOUND,
+        }:
             code = status.HTTP_409_CONFLICT
         elif exc.code == ConversationCode.RUN_TIMEOUT:
             code = status.HTTP_504_GATEWAY_TIMEOUT

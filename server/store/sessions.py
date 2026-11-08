@@ -1,4 +1,13 @@
-"""会话与历史存储：校验归属、顺序读取、整轮提交；模型调用期间不持有事务。"""
+"""MySQL 会话、消息历史与当前任务检查点存储。
+
+职责：
+    agent_session 保存归属、消息水位与当前任务；agent_message 保存已完成任务的有序消息。
+    所有读取先校验用户归属，写入通过短事务锁定会话并核对消息水位。
+
+边界：
+    检查点单独更新，不推进历史水位；完整消息与任务已提交标记在同一事务落库。
+    模型调用和工具执行期间不持有本模块的数据库事务，不承担分布式任务调度。
+"""
 
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -31,6 +40,8 @@ class ConversationCode(StrEnum):
     SESSION_BUSY = "SESSION_BUSY"
     RUN_FAILED = "RUN_FAILED"
     RUN_TIMEOUT = "RUN_TIMEOUT"
+    TASK_PENDING = "TASK_PENDING"
+    TASK_NOT_FOUND = "TASK_NOT_FOUND"
 
 
 class ConversationError(Exception):
@@ -42,7 +53,14 @@ class ConversationError(Exception):
         self.message = message
 
 
+# ============================================================================
+# 会话、消息与对外数据模型
+# ============================================================================
+
+
 class SessionModel(Base):
+    """会话归属与历史水位；task_state 保存一个当前任务，不新增运行调度表。"""
+
     __tablename__ = "agent_session"
     __table_args__ = (
         Index("ix_agent_sessions_user_updated", "user_id", "updated_at", "id"),
@@ -53,11 +71,15 @@ class SessionModel(Base):
     user_id: Mapped[str] = mapped_column(String(MAX_IDENTITY_LENGTH), nullable=False)
     title: Mapped[str] = mapped_column(String(MAX_SESSION_TITLE_LENGTH), nullable=False)
     version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 检查点可能包含未配对的协议块，只在任务恢复时使用，不作为公开消息历史。
+    task_state: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
 
 
 class MessageModel(Base):
+    """已提交的协议消息；sequence 在会话内有序，turn_id 将同一任务的消息归组。"""
+
     __tablename__ = "agent_message"
     __table_args__ = (
         UniqueConstraint("session_id", "sequence", name="uq_conversation_messages_sequence"),
@@ -79,6 +101,8 @@ class MessageModel(Base):
 
 
 class SessionInfo(BaseModel):
+    """会话列表和详情的公开字段，不包含原始任务检查点。"""
+
     id: str
     title: str
     version: int
@@ -94,6 +118,11 @@ def session_info(row: SessionModel) -> SessionInfo:
         created_at=row.created_at.replace(tzinfo=UTC),
         updated_at=row.updated_at.replace(tzinfo=UTC),
     )
+
+
+# ============================================================================
+# 归属校验与短事务存储
+# ============================================================================
 
 
 class SessionStore:
@@ -182,8 +211,13 @@ class SessionStore:
         messages: list[Message],
         *,
         expected_version: int,
+        task_state: dict[str, Any] | None = None,
     ) -> None:
-        """整轮消息原子提交，避免存入未配对的 tool_use/tool_result。"""
+        """原子提交整轮消息与可选任务检查点，避免存入未配对的工具消息。
+
+        expected_version 必须与当前消息水位一致；调用方传入 history_saved 标记时，
+        标记与消息在同一事务提交，防止进程中断后重复追加历史。
+        """
         async with self.session_factory() as session, session.begin():
             owner = await self._session(session, user_id, session_id, lock=True)
             if owner.version != expected_version:
@@ -204,3 +238,33 @@ class SessionStore:
                     )
                 )
             owner.updated_at = utc_now()
+            if task_state is not None:
+                owner.task_state = task_state
+
+    async def load_task(self, user_id: str, session_id: str) -> dict[str, Any] | None:
+        """校验会话归属后读取当前任务；尚无任务时返回 None。"""
+        async with self.session_factory() as session:
+            owner = await self._session(session, user_id, session_id)
+            return owner.task_state
+
+    async def save_task(
+        self, user_id: str, session_id: str, state: dict[str, Any], *, expected_version: int
+    ) -> None:
+        """用短事务保存任务检查点，不修改消息水位。
+
+        Args:
+            user_id: 当前用户身份。
+            session_id: 必须属于该用户的会话标识。
+            state: 已序列化的完整任务检查点。
+            expected_version: 读取历史时的水位；发生变化时拒绝覆盖。
+
+        Raises:
+            ConversationError: 会话不存在、归属不符或历史水位发生变化。
+        """
+        async with self.session_factory() as session, session.begin():
+            owner = await self._session(session, user_id, session_id, lock=True)
+            if owner.version != expected_version:
+                raise ConversationError(
+                    ConversationCode.SESSION_BUSY, "历史已变化，不能覆盖任务检查点。"
+                )
+            owner.task_state = state

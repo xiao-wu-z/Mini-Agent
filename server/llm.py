@@ -40,11 +40,31 @@ class ToolUse(BaseModel):
     input: dict[str, Any]
 
 
+class TokenUsage(BaseModel):
+    """供应商返回的 Token 用量；普通输入、缓存创建和缓存读取分别累计。"""
+
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    cache_creation_input_tokens: int = Field(default=0, ge=0)
+    cache_read_input_tokens: int = Field(default=0, ge=0)
+
+    @property
+    def total(self) -> int:
+        """返回请求预算使用的总消耗，缓存输入也计入执行预算。"""
+        return (
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+        )
+
+
 class LLMTurn(BaseModel):
     """保留完整 content blocks，包含回灌所需的供应商签名等字段。"""
 
     content: list[dict[str, Any]]
     stop_reason: str
+    usage: TokenUsage | None = None
 
     @property
     def text(self) -> str:
@@ -105,6 +125,7 @@ class LLMClient:
         *,
         tools: list[dict[str, Any]] | None = None,
         system: str = "",
+        max_tokens: int | None = None,
     ) -> LLMTurn:
         """请求一次完整模型响应，不在客户端内部执行工具或继续循环。
 
@@ -112,6 +133,7 @@ class LLMClient:
             messages: 当前会话消息，包括前轮 assistant 和对应工具结果。
             tools: Anthropic 工具声明列表，参数格式为 input_schema。
             system: 请求顶层的系统提示词，不放入 messages。
+            max_tokens: 本次生成的输出上限，同时受部署配置的 llm_max_tokens 限制。
 
         Returns:
             包含完整 content blocks 和 stop_reason 的 LLMTurn。
@@ -122,14 +144,47 @@ class LLMClient:
         """
         if self.settings.llm_provider == "echo":
             return LLMTurn(
-                content=[{"type": "text", "text": self._echo(messages)}], stop_reason="end_turn"
+                content=[{"type": "text", "text": self._echo(messages)}],
+                stop_reason="end_turn",
+                usage=TokenUsage(),
             )
-        response = await self.client.post(
-            self.messages_path,
-            json=self._body(messages, system=system, tools=tools, stream=False),
-        )
+        body = self._body(messages, system=system, tools=tools, stream=False)
+        if max_tokens is not None:
+            body["max_tokens"] = min(max_tokens, self.settings.llm_max_tokens)
+        response = await self.client.post(self.messages_path, json=body)
         response.raise_for_status()
         return LLMTurn.model_validate(response.json())
+
+    async def count_tokens(self, messages: list[Message], *, tools: list[dict], system: str) -> int:
+        """计数本次完整模型输入，供 Loop 在生成前预留预算。
+
+        Args:
+            messages: 将要发送的完整协议消息。
+            tools: 本次请求暴露的工具 Schema，也属于输入开销。
+            system: 与生成请求一致的顶层系统提示词。
+
+        Returns:
+            供应商报告的输入 Token 数。关闭计数或接口不支持时，返回 UTF-8 请求字节数
+            作为保守估算；echo 不调用模型，返回零。
+
+        Raises:
+            httpx.HTTPError: 除不支持接口之外的 HTTP 错误，交由上层暂停任务。
+            ValueError: 计数响应中的 input_tokens 无法转换为整数。
+
+        字节估算不是供应商精确计数，不承诺绝对零超支。
+        """
+        body = self._body(messages, system=system, tools=tools, stream=False)
+        body.pop("stream")
+        body.pop("max_tokens")
+        if self.settings.llm_provider == "echo":
+            return 0
+        # 仅在接口明确不支持时降级，避免掩盖鉴权失败、限流等服务错误。
+        if self.settings.llm_count_tokens:
+            response = await self.client.post(self.messages_path + "/count_tokens", json=body)
+            if response.status_code not in {404, 405, 501}:
+                response.raise_for_status()
+                return int(response.json()["input_tokens"])
+        return len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
 
     async def complete(self, messages: list[Message], *, system: str = "") -> str:
         """发起不带工具的单轮请求，并提取全部 text 块。"""

@@ -124,3 +124,32 @@ async def test_echo_does_not_call_network():
         assert await client.complete([Message(role="user", content="hello")]) == "hello"
     finally:
         await client.close()
+
+
+async def test_token_count_fallback_and_output_cap(monkeypatch):
+    settings = real_settings(monkeypatch)
+    requests = []
+
+    def respond(request):
+        body = json.loads(request.content)
+        requests.append((request.url.path, body))
+        if request.url.path.endswith("/count_tokens"):
+            return httpx.Response(404)
+        return httpx.Response(
+            200,
+            json={
+                "content": [{"type": "text", "text": "你好"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 4, "output_tokens": 2, "cache_read_input_tokens": 3},
+            },
+        )
+
+    client = LLMClient(settings, transport=httpx.MockTransport(respond))
+    try:
+        messages = [Message(role="user", content="你好")]
+        assert await client.count_tokens(messages, tools=[], system="规则") > 0
+        result = await client.run_turn(messages, max_tokens=7)
+        assert requests[-1][1]["max_tokens"] == 7
+        assert result.usage.total == 9
+    finally:
+        await client.close()

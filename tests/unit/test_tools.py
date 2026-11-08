@@ -285,7 +285,7 @@ async def test_weather_to_todo_loop_and_tool_followup(todo_store):
     requests = []
 
     class ScenarioLLM:
-        async def run_turn(self, messages, *, tools, system):
+        async def run_turn(self, messages, *, tools, system, max_tokens=None):
             requests.append([message.model_dump() for message in messages])
             return turns.popleft()
 

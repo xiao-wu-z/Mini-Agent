@@ -6,10 +6,10 @@
 """
 
 import secrets
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Request, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from server.conversations import ChatResponse, ConversationService
 from server.store.sessions import (
@@ -62,8 +62,19 @@ class CreateSession(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    """任务操作请求；人工核实的操作 ID 与模型业务参数分开传递。"""
+
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-    message: str = Field(min_length=1, max_length=MAX_USER_INPUT_LENGTH)
+    message: str = Field(default="继续", min_length=1, max_length=MAX_USER_INPUT_LENGTH)
+    action: Literal["new", "continue", "cancel"] = "new"
+    confirmed_not_executed: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def require_new_input(self):
+        """新任务必须显式提供目标；继续和取消可以省略消息文本。"""
+        if self.action == "new" and "message" not in self.model_fields_set:
+            raise ValueError("new requires message")
+        return self
 
 
 @router.post("", response_model=SessionInfo, status_code=status.HTTP_201_CREATED)
@@ -131,4 +142,16 @@ async def chat(
     user_id: User,
     service: Service,
 ) -> ChatResponse:
-    return await service.chat(user_id, session_id, body.message)
+    return await service.chat(
+        user_id,
+        session_id,
+        body.message,
+        action=body.action,
+        confirmed_not_executed=body.confirmed_not_executed,
+    )
+
+
+@router.get("/{session_id}/task")
+async def current_task(session_id: SessionId, user_id: User, service: Service) -> dict:
+    """查询当前窗口的任务摘要；归属校验与检查点过滤由会话服务统一处理。"""
+    return await service.task(user_id, session_id)

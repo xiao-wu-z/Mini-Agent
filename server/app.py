@@ -17,6 +17,7 @@ from server.store._db import Database
 from server.store.sessions import ConversationCode, ConversationError, SessionStore
 from server.store.todos import TodoStore
 from server.store.tool_results import ToolResultStore
+from server.store.traces import TraceStore
 from server.tools import create_default_tools
 
 
@@ -78,6 +79,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         result_store=result_store,
                     ),
                     timeout_seconds=settings.agent_run_timeout_seconds,
+                    trace_store=TraceStore(app.state.database.session_factory),
+                    trace_policy=settings.tracing,
                 )
             yield
 

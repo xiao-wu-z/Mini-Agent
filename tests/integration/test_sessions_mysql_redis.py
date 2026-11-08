@@ -1,23 +1,28 @@
 """真实 MySQL/Redis 的基础会话与历史恢复验证。"""
 
 import asyncio
+import json
 import os
 from collections import deque
 from uuid import uuid4
 
+import httpx
 import pytest
 from redis.asyncio import Redis
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from server.agent_loop import AgentLoop
+from server.app import create_app
 from server.cache import SessionCache
-from server.conversations import ConversationService
+from server.config import get_settings
+from server.conversations import ChatResponse, ConversationService
 from server.llm import LLMTurn
 from server.store.sessions import MessageModel, SessionModel, SessionStore
 from server.store.todos import TodoModel, TodoStore
 from server.store.tool_results import ToolResultModel, ToolResultStore
+from server.store.traces import SpanModel, TraceModel, TraceStore
 from server.tools import create_default_tools
 from skills._shared.context import ToolContext
 
@@ -38,6 +43,7 @@ async def test_mysql_redis_session_history(monkeypatch):
     redis = Redis.from_url(os.environ[REDIS_VARIABLE], decode_responses=True)
     cache = SessionCache(redis, ttl_seconds=300)
     store = SessionStore(factory)
+    traces = TraceStore(factory)
     user_id = f"sessions-{uuid4().hex}"
     ids = []
 
@@ -55,8 +61,28 @@ async def test_mysql_redis_session_history(monkeypatch):
         first = await store.create(user_id, "天气")
         second = await store.create(user_id, "周报")
         ids.extend([first.id, second.id])
-        service = ConversationService(store, cache, loop, timeout_seconds=120)
-        await service.chat(user_id, first.id, "我叫小明")
+        service = ConversationService(store, cache, loop, timeout_seconds=120, trace_store=traces)
+        app = create_app(get_settings())
+        app.state.conversations = service
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                f"/sessions/{first.id}/chat",
+                json={"message": "我叫小明"},
+                headers={"X-User-ID": user_id},
+            )
+        assert response.headers["content-type"].startswith("text/event-stream")
+        done = next(
+            frame for frame in response.text.split("\n\n") if frame.startswith("event: done\n")
+        )
+        reply = ChatResponse.model_validate(json.loads(done.split("\ndata: ", 1)[1]))
+        detail = await traces.detail(user_id, first.id, reply.trace_id)
+        assert detail["trace"]["task_id"] == reply.turn_id
+        assert detail["trace"]["status"] == "success"
+        assert detail["trace"]["request_tokens"] == reply.request_tokens
+        assert any(span["type"] == "generation" for span in detail["spans"])
+        assert detail["tree"]
         restored = ConversationService(
             SessionStore(factory),
             SessionCache(redis, ttl_seconds=300),
@@ -134,6 +160,14 @@ async def test_mysql_redis_session_history(monkeypatch):
 
     finally:
         async with factory() as session, session.begin():
+            await session.execute(
+                delete(SpanModel).where(
+                    SpanModel.trace_id.in_(
+                        select(TraceModel.id).where(TraceModel.user_id == user_id)
+                    )
+                )
+            )
+            await session.execute(delete(TraceModel).where(TraceModel.user_id == user_id))
             await session.execute(delete(ToolResultModel).where(ToolResultModel.user_id == user_id))
             await session.execute(delete(TodoModel).where(TodoModel.user_id == user_id))
             await session.execute(delete(MessageModel).where(MessageModel.session_id.in_(ids)))

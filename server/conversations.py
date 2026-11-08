@@ -22,9 +22,13 @@ from pydantic import BaseModel
 
 from server.agent_loop import AgentLoop, TaskState, ToolTrace
 from server.cache import SessionCache
+from server.config import TracePolicy
 from server.context import ContextState
 from server.llm import Message
+from server.sse import EventSink, StreamEvent
 from server.store.sessions import ConversationCode, ConversationError, SessionStore
+from server.store.traces import TraceStore
+from server.tracing import TraceRecorder
 from skills._shared.context import ToolContext
 
 logger = logging.getLogger(__name__)
@@ -47,6 +51,7 @@ class ChatResponse(BaseModel):
     request_tokens: int = 0
     total_tokens: int = 0
     usage_estimated: bool = False
+    trace_id: str | None = None
 
 
 class ConversationService:
@@ -59,11 +64,15 @@ class ConversationService:
         loop: AgentLoop,
         *,
         timeout_seconds: float,
+        trace_store: TraceStore | None = None,
+        trace_policy: TracePolicy | None = None,
     ):
         self.store = store
         self.cache = cache
         self.loop = loop
         self.timeout_seconds = timeout_seconds
+        self.trace_store = trace_store
+        self.trace_policy = trace_policy or TracePolicy()
         self._locks: dict[str, asyncio.Lock] = {}
 
     async def history(self, user_id: str, session_id: str) -> list[Message]:
@@ -85,6 +94,7 @@ class ConversationService:
         *,
         action: str = "new",
         confirmed_not_executed: list[str] | None = None,
+        on_event: EventSink | None = None,
     ) -> ChatResponse:
         """串行处理一个窗口的任务请求，并在退出时释放进程内会话锁。
 
@@ -94,6 +104,7 @@ class ConversationService:
             text: 新任务目标或继续任务时的补充信息。
             action: new 创建任务，continue 恢复任务，cancel 取消后续执行。
             confirmed_not_executed: 经调用方核实未执行的未知操作 ID；仅用于继续当前任务。
+            on_event: SSE 使用的公开事件回调，CLI 等同步调用可省略。
 
         Returns:
             最终答案或暂停提示，以及本次请求用量与任务状态。
@@ -107,14 +118,39 @@ class ConversationService:
         if lock.locked():
             raise ConversationError(ConversationCode.SESSION_BUSY, "会话正在处理请求。")
         async with lock:
+            trace = TraceRecorder(self.trace_store, policy=self.trace_policy)
             try:
-                return await self._chat(
+                await trace.start(user_id=user_id, session_id=session_id, action=action, text=text)
+                if on_event is not None:
+                    await on_event(
+                        StreamEvent(
+                            event="start",
+                            data={
+                                "session_id": session_id,
+                                "trace_id": trace.id,
+                            },
+                        )
+                    )
+                result = await self._chat(
                     user_id,
                     session_id,
                     text,
                     action=action,
                     confirmed_not_executed=confirmed_not_executed or [],
+                    trace=trace,
+                    on_event=on_event,
                 )
+                result.trace_id = trace.id
+                status = "success" if result.task_status == "completed" else result.task_status
+                await trace.finish(status, reason=result.stop_reason, output=result.text)
+                return result
+            except asyncio.CancelledError:
+                await trace.finish("cancelled", reason="request_cancelled")
+                raise
+            except Exception as exc:
+                reason = exc.code if isinstance(exc, ConversationError) else type(exc).__name__
+                await trace.finish("error", reason=reason)
+                raise
             finally:
                 self._locks.pop(session_id, None)
 
@@ -126,14 +162,19 @@ class ConversationService:
         *,
         action: str,
         confirmed_not_executed: list[str],
+        trace: TraceRecorder,
+        on_event: EventSink | None,
     ) -> ChatResponse:
         """在持有当前会话锁时处理任务生命周期与历史提交。"""
         # ---- 1. 恢复完成后尚未提交的历史，避免重复执行原任务 ----
         info = await self.store.get(user_id, session_id)
         raw = await self.store.load_task(user_id, session_id)
         task = TaskState.model_validate(raw) if raw is not None else None
+        if task is not None:
+            await trace.bind_task(task.task_id, checkpoint_id=task.checkpoint.id)
         if task is not None and task.status == "completed" and not task.history_saved:
             await self._commit(user_id, session_id, task, info.version)
+            await trace.event("history.recovered", attributes={"task_id": task.task_id})
             info = await self.store.get(user_id, session_id)
         # ---- 2. 处理取消与继续；未完成任务不能被新目标静默覆盖 ----
         if action == "cancel":
@@ -159,6 +200,7 @@ class ConversationService:
         continuing = action == "continue"
         active = task is not None and task.status in {"running", "paused", "waiting_user"}
         if continuing and task is not None and task.status == "completed":
+            await trace.event("task.answer_reused")
             last = task.messages[-1].content
             answer = (
                 last
@@ -183,6 +225,14 @@ class ConversationService:
             raise ConversationError(
                 ConversationCode.TASK_PENDING, "当前任务未结束，请显式继续或取消，不能覆盖进度。"
             )
+        if continuing:
+            await trace.event(
+                "task.resumed",
+                attributes={
+                    "checkpoint_id": task.checkpoint.id,
+                    "checkpoint_version": task.checkpoint.version,
+                },
+            )
         # ---- 3. 核对人工确认的操作归属，只有当前任务的 unknown 操作可以放行 ----
         if confirmed_not_executed:
             unknown = (
@@ -204,6 +254,9 @@ class ConversationService:
         history = [] if continuing else await self.history(user_id, session_id)
         raw_context = await self.store.load_context(user_id, session_id)
         context_state = ContextState.model_validate(raw_context or {})
+        task_id = task.task_id if continuing else uuid4().hex
+        if not continuing:
+            await trace.bind_task(task_id)
 
         async def checkpoint(state: TaskState) -> None:
             """独立短事务保存进度；不在模型和工具执行期间持有数据库事务。"""
@@ -217,10 +270,12 @@ class ConversationService:
                 result = await self.loop.run(
                     text,
                     history=history,
-                    context=ToolContext(user_id=user_id, session_id=session_id),
+                    context=ToolContext(user_id=user_id, session_id=session_id, run_id=task_id),
                     state=task if continuing else None,
                     checkpoint=checkpoint,
                     context_state=context_state,
+                    trace=trace,
+                    on_event=on_event,
                 )
         except asyncio.CancelledError:
             raise
@@ -235,7 +290,8 @@ class ConversationService:
                 code, "任务已中断；请查询当前任务检查点，再使用 continue 继续。"
             ) from exc
         if result.state.status == "completed":
-            await self._commit(user_id, session_id, result.state, info.version)
+            async with trace.span("history.commit"):
+                await self._commit(user_id, session_id, result.state, info.version)
         return ChatResponse(
             session_id=session_id,
             turn_id=result.run_id,

@@ -17,6 +17,7 @@ from server.skill_runner import SkillRunner
 from server.store.base import Base
 from server.store.sessions import SessionStore
 from server.store.tool_results import ToolResultStore
+from server.store.traces import TraceStore
 from server.tools import Tool, create_default_tools
 from skills._shared.context import ToolContext
 from skills.calculator.handler import CalculatorArgs
@@ -210,8 +211,13 @@ async def test_persisted_result_recovers_unknown_write_without_reexecution(store
     loop = AgentLoop(
         Model(), tools, result_store=results, result_policy=ToolResultPolicy(inline_max_bytes=256)
     )
+    trace_store = TraceStore(sessions.session_factory)
     service = ConversationService(
-        sessions, SessionCache(redis, ttl_seconds=60), loop, timeout_seconds=120
+        sessions,
+        SessionCache(redis, ttl_seconds=60),
+        loop,
+        timeout_seconds=120,
+        trace_store=trace_store,
     )
     with pytest.raises(asyncio.CancelledError):
         await service.chat("a", info.id, "执行")
@@ -226,6 +232,10 @@ async def test_persisted_result_recovers_unknown_write_without_reexecution(store
     assert resumed.task_status == "completed"
     assert len(executions) == 1
     assert raw["operations"][0]["id"] == executions[0]
+    detail = await trace_store.detail("a", info.id, resumed.trace_id)
+    assert any(s["name"] == "tool.result_reused" for s in detail["spans"])
+    assert not any(s["name"] == "tool.write" for s in detail["spans"])
+    assert len((await sessions.load_task("a", info.id))["traces"]) == 1
 
 
 async def test_missing_reference_pauses_before_model_can_repeat_original_tool(stores):

@@ -55,3 +55,63 @@ CREATE TABLE agent_tool_result (
 )CHARSET=utf8mb4 COLLATE utf8mb4_bin;
 
 CREATE INDEX ix_agent_tool_result_scope ON agent_tool_result (user_id, session_id);
+
+CREATE TABLE agent_trace (
+    id VARCHAR(32) NOT NULL,
+    user_id VARCHAR(64) NOT NULL,
+    session_id VARCHAR(32) NOT NULL,
+    task_id VARCHAR(32),
+    checkpoint_id VARCHAR(32),
+    action VARCHAR(32) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    stop_reason VARCHAR(100),
+    started_at DATETIME NOT NULL,
+    ended_at DATETIME,
+    duration_ms FLOAT,
+    input_summary TEXT,
+    output_summary TEXT,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    cache_creation_input_tokens INTEGER NOT NULL,
+    cache_read_input_tokens INTEGER NOT NULL,
+    request_tokens INTEGER NOT NULL,
+    usage_estimated BOOL NOT NULL,
+    dropped_spans INTEGER NOT NULL,
+    CONSTRAINT pk_agent_trace PRIMARY KEY (id),
+    CONSTRAINT fk_agent_trace_session_id_agent_session FOREIGN KEY(session_id) REFERENCES agent_session (id)
+)CHARSET=utf8mb4 COLLATE utf8mb4_bin;
+
+CREATE INDEX ix_agent_trace_scope_started ON agent_trace (user_id, session_id, started_at, id);
+
+CREATE INDEX ix_agent_trace_task_started ON agent_trace (task_id, started_at, id);
+
+CREATE TABLE agent_span (
+    id VARCHAR(32) NOT NULL,
+    trace_id VARCHAR(32) NOT NULL,
+    parent_span_id VARCHAR(32),
+    sequence INTEGER NOT NULL,
+    type VARCHAR(32) NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    started_at DATETIME NOT NULL,
+    ended_at DATETIME,
+    duration_ms FLOAT,
+    input_summary TEXT,
+    output_summary TEXT,
+    error_code VARCHAR(100),
+    stop_reason VARCHAR(100),
+    model VARCHAR(200),
+    tool_use_id VARCHAR(200),
+    operation_id VARCHAR(32),
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    cache_creation_input_tokens INTEGER NOT NULL,
+    cache_read_input_tokens INTEGER NOT NULL,
+    usage_estimated BOOL NOT NULL,
+    attributes JSON NOT NULL,
+    CONSTRAINT pk_agent_span PRIMARY KEY (id),
+    CONSTRAINT uq_agent_span_trace_sequence UNIQUE (trace_id, sequence),
+    CONSTRAINT fk_agent_span_trace_id_agent_trace FOREIGN KEY(trace_id) REFERENCES agent_trace (id)
+)CHARSET=utf8mb4 COLLATE utf8mb4_bin;
+
+CREATE INDEX ix_agent_span_parent ON agent_span (trace_id, parent_span_id);

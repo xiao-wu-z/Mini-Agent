@@ -23,6 +23,7 @@ from server.store._db import Database
 from server.store.sessions import SessionStore
 from server.store.todos import TodoStore
 from server.store.tool_results import ToolResultStore
+from server.store.traces import TraceStore
 from server.tools import create_default_tools
 from skills._shared.context import ToolContext
 
@@ -106,6 +107,8 @@ async def main() -> None:
                 ),
                 loop,
                 timeout_seconds=settings.agent_run_timeout_seconds,
+                trace_store=TraceStore(database.session_factory),
+                trace_policy=settings.tracing,
             )
             result = await service.chat(
                 arguments.user_id,
@@ -119,6 +122,8 @@ async def main() -> None:
                 confirmed_not_executed=arguments.retry_operation,
             )
         print(result.text)
+        if not arguments.stateless and result.trace_id is not None:
+            print(f"[trace_id={result.trace_id}]")
         print(f"[stop_reason={result.stop_reason}, rounds={result.rounds}]")
         if arguments.stateless:
             print(f"[session_id={session_id}, stateless=true]")

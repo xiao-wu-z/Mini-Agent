@@ -36,10 +36,12 @@ from server.config import (
     ToolResultPolicy,
 )
 from server.context import SUMMARY_SYSTEM, ContextState, message_units, summary_input
-from server.llm import LLMTurn, Message, ToolUse
+from server.llm import LLMTurn, Message, TextDeltaCallback, TokenUsage, ToolUse
 from server.skill_runner import SkillRunner
+from server.sse import EventSink, StreamEvent, tool_result_event, tool_use_event
 from server.store.tool_results import ToolResultStore
 from server.tools import ToolRegistry
+from server.tracing import SpanHandle, TraceRecorder
 from skills._shared.context import ToolContext
 
 logger = logging.getLogger(__name__)
@@ -222,6 +224,9 @@ class AgentLoop:
         reflection_record: FailureRecord | None = None,
         output_limit: int | None = None,
         phase: str = "model",
+        trace: TraceRecorder | None = None,
+        parent_span_id: str | None = None,
+        on_text_delta: TextDeltaCallback | None = None,
     ) -> LLMTurn:
         """为一次模型调用预留预算，并按供应商 usage 结算。
 
@@ -234,6 +239,9 @@ class AgentLoop:
             reflection_record: 本次复盘所属记录；请求前标记已尝试，避免中断后重复复盘。
             output_limit: 摘要等辅助调用的额外输出上限，与部署和剩余预算共同限制。
             phase: 随额度预留一同保存的当前执行阶段。
+            trace: 请求内采集器，不保存于任务检查点，也不参与模型决策。
+            parent_span_id: 调用方显式指定的所属步骤。
+            on_text_delta: 仅主决策的公开文本增量回调；摘要和复盘不传入。
 
         Returns:
             包含完整内容块和停止原因的单轮响应。
@@ -270,7 +278,58 @@ class AgentLoop:
         state.usage_estimated = True
         state.checkpoint.phase = phase
         await save()
-        turn = await self.llm.run_turn(messages, tools=tools, system=system, max_tokens=output_cap)
+        recorder = trace or TraceRecorder()
+        settings = getattr(self.llm, "settings", None)
+        model_name = getattr(settings, "llm_model", None)
+        generation_name = {
+            "model": "decision",
+            "compression": "summary",
+            "reflection": "reflection",
+        }
+        async with recorder.span(
+            "generation." + generation_name[phase],
+            type="generation",
+            parent_id=parent_span_id,
+            input={
+                "message_count": len(messages),
+                "tool_names": [t["name"] for t in tools],
+                "input_tokens": estimated_input,
+                "max_output_tokens": output_cap,
+            },
+            model=model_name,
+        ) as generation:
+            turn = None
+            try:
+                stream_turn = getattr(self.llm, "stream_turn", None)
+                if on_text_delta is not None and stream_turn is not None:
+                    turn = await stream_turn(
+                        messages,
+                        tools=tools,
+                        system=system,
+                        max_tokens=output_cap,
+                        on_text_delta=on_text_delta,
+                    )
+                else:
+                    turn = await self.llm.run_turn(
+                        messages, tools=tools, system=system, max_tokens=output_cap
+                    )
+                    if on_text_delta is not None and turn.text:
+                        await on_text_delta(turn.text)
+            finally:
+                usage = turn.usage if turn is not None else None
+                generation.usage(
+                    usage or TokenUsage(input_tokens=estimated_input, output_tokens=output_cap),
+                    estimated=usage is None,
+                )
+            generation.output(
+                {
+                    "text": turn.text,
+                    "tool_names": [
+                        b.get("name") for b in turn.content if b.get("type") == "tool_use"
+                    ],
+                },
+                stop_reason=turn.stop_reason,
+            )
         # ---- 3. 有实际 usage 时结算差额，否则保留预留值并标记估算 ----
         if turn.usage is not None:
             difference = turn.usage.total - reserved
@@ -283,7 +342,11 @@ class AgentLoop:
         return turn
 
     async def _prepare_context(
-        self, state: TaskState, save: Callable[[], Awaitable[None]]
+        self,
+        state: TaskState,
+        save: Callable[[], Awaitable[None]],
+        trace: TraceRecorder | None = None,
+        parent_span_id: str | None = None,
     ) -> list[Message]:
         """模型决策前同步压缩中段；先生成并校验新视图，再保存摘要检查点。
 
@@ -291,6 +354,7 @@ class AgentLoop:
         失败或未缩短输入时不覆盖旧摘要，容量不足则暂停，绝不硬截协议块。
         """
         policy = self.context_policy
+        recorder = trace or TraceRecorder()
         goal_index = len(state.messages) - len(state.task_messages)
 
         def render(context: ContextState) -> list[Message]:
@@ -342,11 +406,18 @@ class AgentLoop:
                     save,
                     output_limit=policy.summary_max_tokens,
                     phase="compression",
+                    trace=trace,
+                    parent_span_id=parent_span_id,
                 )
             except (BudgetStop, asyncio.CancelledError):
                 raise
             except Exception:
                 logger.warning("context_compression_failed")
+                await recorder.event(
+                    "context.compression_failed",
+                    parent_id=parent_span_id,
+                    attributes={"reason": "model_error"},
+                )
                 if required:
                     raise BudgetStop("compression_failed") from None
                 return view
@@ -355,6 +426,11 @@ class AgentLoop:
                 or not turn.text.strip()
                 or any(block.get("type") == "tool_use" for block in turn.content)
             ):
+                await recorder.event(
+                    "context.compression_failed",
+                    parent_id=parent_span_id,
+                    attributes={"reason": "invalid_summary"},
+                )
                 if required:
                     raise BudgetStop("compression_failed")
                 return view
@@ -366,12 +442,28 @@ class AgentLoop:
             candidate_view = render(candidate)
             candidate_tokens = await self._count(candidate_view, self.tools.specs(), self.system)
             if candidate_tokens >= tokens:
+                await recorder.event(
+                    "context.compression_failed",
+                    parent_id=parent_span_id,
+                    attributes={"reason": "ineffective_summary"},
+                )
                 if required:
                     raise BudgetStop("compression_ineffective")
                 return view
             # ---- 3. 发布新摘要与边界；原始消息、稳定操作标识不变 ----
             state.context_state = candidate
             await save()
+            await recorder.event(
+                "context.compressed",
+                parent_id=parent_span_id,
+                attributes={
+                    "input_tokens_before": tokens,
+                    "input_tokens_after": candidate_tokens,
+                    "summary_version": candidate.version,
+                    "start_sequence": candidate.start + 1,
+                    "until_sequence": candidate.end,
+                },
+            )
             view, tokens = candidate_view, candidate_tokens
             if tokens < hard:
                 return view
@@ -452,6 +544,8 @@ class AgentLoop:
         state: TaskState | None = None,
         checkpoint: Callable[[TaskState], Awaitable[None]] | None = None,
         context_state: ContextState | None = None,
+        trace: TraceRecorder | None = None,
+        on_event: EventSink | None = None,
     ) -> AgentResult:
         """执行一次用户请求，返回已完成或可恢复的任务结果。
 
@@ -462,6 +556,8 @@ class AgentLoop:
             state: 待恢复的任务检查点；未提供时创建新任务。
             checkpoint: 接收状态副本的异步回调；未提供时仅在内存中执行。
             context_state: 新任务沿用的会话摘要与结果引用视图；恢复任务使用检查点中的值。
+            trace: 显式请求内采集器，跨恢复请求创建新的采集器，不沿用旧 Span。
+            on_event: 公开文本与工具执行摘要的异步回调；内部推理不进入该回调。
 
         Returns:
             最终文本或暂停提示，以及用量、工具 trace 和后续恢复所需的任务状态。
@@ -472,6 +568,9 @@ class AgentLoop:
 
         模型、工具基础设施和检查点写入异常向上层传播；保存失败时无法保证最新进度已落库。
         """
+        recorder = trace or TraceRecorder()
+        round_span_id: str | None = None
+        round_handle: SpanHandle | None = None
         # 新请求只重置本次预算；失败计数、已完成操作与任务累计消耗不清零。
         if not user_input.strip():
             raise ValueError("User input must not be empty")
@@ -491,6 +590,19 @@ class AgentLoop:
         state.request_tokens, state.request_steps = 0, 0
         run_context = (context or ToolContext()).model_copy(update={"run_id": state.task_id})
 
+        async def emit_text(text: str) -> None:
+            """主模型文本直接推送；以最终 done 状态判断是否完整完成。"""
+            if on_event is not None and text:
+                await on_event(
+                    StreamEvent(
+                        event="text_delta",
+                        data={
+                            "text": text,
+                            "round": state.request_steps,
+                        },
+                    )
+                )
+
         async def save() -> None:
             """传递状态副本，防止回调持有并修改 Loop 正在使用的对象。"""
             state.checkpoint.version += 1
@@ -504,11 +616,20 @@ class AgentLoop:
             state.status = "waiting_user" if waiting else "paused"
             state.reason = reason
             state.checkpoint.phase = state.status
+            await recorder.event(
+                "task.paused",
+                parent_id=round_span_id,
+                attributes={"reason": reason, "status": state.status},
+            )
+            await recorder.finish_span(round_handle, status=state.status, reason=reason)
             await save()
             return self._result(state, text, reason)
 
         await save()
         try:
+            if state.operations:
+                round_handle = await recorder.start_span("loop.resume")
+                round_span_id = round_handle.id
             while True:
                 # ---- 1. 完成已持久化的工具调用，成功结果不重复执行 ----
                 for operation in state.operations:
@@ -537,7 +658,6 @@ class AgentLoop:
                     operation.status = "unknown"
                     state.checkpoint.phase = "tools"
                     await save()
-                    started = asyncio.get_running_loop().time()
                     call_context = run_context.model_copy(
                         update={
                             "operation_id": operation.id,
@@ -545,20 +665,52 @@ class AgentLoop:
                             "recovering": recovering,
                         }
                     )
-                    result = (
-                        cached_result
-                        if cached_result is not None
-                        else await self.runner.execute(
-                            operation.call, timeout=self.tool_timeout, context=call_context
+                    if cached_result is not None:
+                        await recorder.event(
+                            "tool.result_reused",
+                            parent_id=round_span_id,
+                            attributes={
+                                "tool": operation.call.name,
+                                "operation_id": operation.id,
+                                "tool_use_id": operation.call.id,
+                            },
                         )
-                    )
-                    duration_ms = (asyncio.get_running_loop().time() - started) * 1000
+                        result = cached_result
+                        duration_ms = 0
+                    else:
+                        if on_event is not None:
+                            await on_event(tool_use_event(operation.call.name, operation.call.id))
+                        async with recorder.span(
+                            "tool." + operation.call.name,
+                            parent_id=round_span_id,
+                            input=operation.call.input,
+                            tool_use_id=operation.call.id,
+                            operation_id=operation.id,
+                        ) as tool_span:
+                            started = asyncio.get_running_loop().time()
+                            result = await self.runner.execute(
+                                operation.call, timeout=self.tool_timeout, context=call_context
+                            )
+                            duration_ms = (asyncio.get_running_loop().time() - started) * 1000
+                            tool_payload = json.loads(result["content"])
+                            result_bytes = len(result["content"].encode())
+                            tool_span.output(
+                                {
+                                    "is_error": result.get("is_error", False),
+                                    "size_bytes": result_bytes,
+                                    "result": tool_payload
+                                    if result_bytes <= self.result_policy.inline_max_bytes
+                                    else "[large result omitted]",
+                                },
+                                error_code=tool_payload.get("error", {}).get("code"),
+                            )
                     logger.info(
-                        "tool_executed tool=%s call_id=%s duration_ms=%.2f is_error=%s",
+                        "tool_result tool=%s call_id=%s duration_ms=%.2f is_error=%s reused=%s",
                         operation.call.name,
                         operation.call.id,
                         duration_ms,
                         result.get("is_error", False),
+                        cached_result is not None,
                     )
                     payload = json.loads(result["content"])
                     error_code = payload.get("error", {}).get("code")
@@ -568,6 +720,16 @@ class AgentLoop:
                     )
                     # 写操作超时或异常不能证明事务未提交，保留 unknown 等待核实。
                     if not read_only and error_code in {"TOOL_TIMEOUT", "TOOL_ERROR"}:
+                        if on_event is not None:
+                            await on_event(
+                                tool_result_event(
+                                    operation.call.name,
+                                    operation.call.id,
+                                    is_error=True,
+                                    duration_ms=duration_ms,
+                                    unknown=True,
+                                )
+                            )
                         return await stop(
                             "unknown_tool_result",
                             "写操作结果不确定，已保存检查点，继续前需要核实状态。",
@@ -575,15 +737,16 @@ class AgentLoop:
                         )
                     # 先放入状态，外置存储失败时仍能保留已执行结果，避免盲目重放写操作。
                     operation.result, operation.status = result, "done"
-                    state.traces.append(
-                        ToolTrace(
-                            round=state.request_steps,
-                            tool_use_id=operation.call.id,
-                            name=operation.call.name,
-                            is_error=result.get("is_error", False),
-                            duration_ms=duration_ms,
+                    if cached_result is None:
+                        state.traces.append(
+                            ToolTrace(
+                                round=state.request_steps,
+                                tool_use_id=operation.call.id,
+                                name=operation.call.name,
+                                is_error=result.get("is_error", False),
+                                duration_ms=duration_ms,
+                            )
                         )
-                    )
                     key = observe(state.failures, operation.call.name, operation.call.input, result)
                     if (
                         len(result["content"].encode()) > self.result_policy.inline_max_bytes
@@ -591,6 +754,21 @@ class AgentLoop:
                         and operation.call.name != "read_tool_result"
                     ):
                         await self.result_store.put(operation.id, result, context=run_context)
+                        await recorder.event(
+                            "tool.result_persisted",
+                            parent_id=round_span_id,
+                            attributes={"ref": operation.id},
+                        )
+                    if on_event is not None:
+                        await on_event(
+                            tool_result_event(
+                                operation.call.name,
+                                operation.call.id,
+                                is_error=result.get("is_error", False),
+                                duration_ms=duration_ms,
+                                reused=cached_result is not None,
+                            )
+                        )
                     # 引用丢失时交还用户决定，避免模型紧接着重新调用原写工具。
                     if operation.call.name == "read_tool_result" and error_code == "NOT_FOUND":
                         return await stop(
@@ -616,6 +794,8 @@ class AgentLoop:
                 if state.operations:
                     await self._collect_results(state, run_context)
                     await save()
+                await recorder.finish_span(round_handle)
+                round_handle, round_span_id = None, None
                 # 用户补充信息放在工具结果之后，保持 assistant/tool_result 的紧邻关系。
                 if state.resume_note:
                     message = Message(role="user", content=state.resume_note)
@@ -661,6 +841,8 @@ class AgentLoop:
                         save,
                         reflection_record=record,
                         phase="reflection",
+                        trace=recorder,
+                        parent_span_id=round_span_id,
                     )
                     record.reflected = True
                     state.reflection_pending.pop(0)
@@ -681,8 +863,42 @@ class AgentLoop:
                     # 同批次可能有多个错误簇，先逐个复盘，再让主模型决策。
                     continue
                 # ---- 3. 正常决策；没有工具调用时完成任务 ----
-                view = await self._prepare_context(state, save)
-                turn = await self._model(state, view, self.tools.specs(), self.system, save)
+                async with recorder.span(
+                    "context.prepare",
+                    input={
+                        "source_message_count": len(state.messages),
+                        "summary_version": state.context_state.version,
+                    },
+                ) as context_span:
+                    try:
+                        view = await self._prepare_context(state, save, recorder, context_span.id)
+                    except BudgetStop as exc:
+                        context_span.output(
+                            {"reason": exc.reason}, status="paused", stop_reason=exc.reason
+                        )
+                        raise
+                    context_span.output(
+                        {
+                            "message_count": len(view),
+                            "summary_version": state.context_state.version,
+                            "summary_until_sequence": state.context_state.end,
+                        }
+                    )
+                # 模型决策与其触发的工具执行是同一轮的兄弟步骤；轮次父节点显式保留。
+                round_handle = await recorder.start_span(
+                    "loop.round", attributes={"round": state.request_steps + 1}
+                )
+                round_span_id = round_handle.id
+                turn = await self._model(
+                    state,
+                    view,
+                    self.tools.specs(),
+                    self.system,
+                    save,
+                    trace=recorder,
+                    parent_span_id=round_span_id,
+                    on_text_delta=emit_text if on_event is not None else None,
+                )
                 if turn.stop_reason == "max_tokens":
                     return await stop(
                         "max_tokens", "模型输出被截断，任务已暂停，未执行截断响应中的工具。"
@@ -714,16 +930,20 @@ class AgentLoop:
                     state.status, state.reason = "completed", turn.stop_reason
                     state.checkpoint.phase = "completed"
                     await save()
+                    await recorder.event("task.completed", parent_id=round_span_id)
+                    await recorder.finish_span(round_handle)
                     return self._result(state, turn.text, turn.stop_reason)
                 await save()
         except BudgetStop as exc:
             return await stop(exc.reason, "本次请求执行预算已用尽，进度已保存，可以继续。")
         except asyncio.CancelledError:
+            await recorder.finish_span(round_handle, status="cancelled", reason="request_cancelled")
             state.status, state.reason = "paused", "cancelled"
             state.checkpoint.phase = "paused"
             await save()
             raise
         except Exception:
+            await recorder.finish_span(round_handle, status="error", reason="execution_error")
             state.status, state.reason = "paused", "execution_error"
             state.checkpoint.phase = "paused"
             await save()

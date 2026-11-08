@@ -50,6 +50,15 @@ class ToolResultPolicy(BaseModel):
     cache_ttl_seconds: int = Field(default=3600, ge=1)
 
 
+class TracePolicy(BaseModel):
+    """独立埋点写入与有界采集策略，失败时不阻塞业务流程。"""
+
+    enabled: bool = True
+    write_timeout_seconds: float = Field(default=0.25, gt=0)
+    preview_chars: int = Field(default=1024, ge=1, le=20000)
+    max_spans: int = Field(default=512, ge=1, le=1000)
+
+
 def selected_environment() -> Environment:
     value = os.environ.get("APP_ENV", "development")
     if value not in {"development", "testing", "production"}:
@@ -111,8 +120,10 @@ class Settings(BaseSettings):
 
     context: ContextPolicy = Field(default_factory=ContextPolicy)
     tool_result: ToolResultPolicy = Field(default_factory=ToolResultPolicy)
+    tracing: TracePolicy = Field(default_factory=TracePolicy)
     session_cache_ttl_seconds: int = Field(default=300, ge=1)
     agent_run_timeout_seconds: float = Field(default=120, gt=0)
+    sse_heartbeat_seconds: float = Field(default=15, gt=0)
     api_token: SecretStr = SecretStr("")
 
     @classmethod

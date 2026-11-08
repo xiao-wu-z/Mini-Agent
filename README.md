@@ -379,7 +379,7 @@ checkpoint 元信息包括 id、version、phase、updated_at，只保留最新�
 | GET | /sessions | 当前用户的会话列表，支持 limit/offset |
 | GET | /sessions/{id} | 校验归属并读取会话 |
 | GET | /sessions/{id}/messages | 历史分页，支持 after/limit |
-| POST | /sessions/{id}/chat | 接着聊，body 为 `{"message":"继续"}` |
+| POST | /sessions/{id}/chat | SSE 流式聊天，body 为 `{"message":"继续"}` |
 
 开发环境通过 X-User-ID 指定身份；这是可信调用方协议，不是登录认证。
 生产入口由可信网关注入身份并提供 AGENT_API_TOKEN 对应的 Bearer Token。
@@ -389,10 +389,48 @@ checkpoint 元信息包括 id、version、phase、updated_at，只保留最新�
 curl -X POST http://127.0.0.1:8000/sessions \
   -H 'X-User-ID: user-a' -H 'Content-Type: application/json' \
   -d '{"title":"天气"}'
-curl -X POST 'http://127.0.0.1:8000/sessions/<返回的ID>/chat' \
+curl -N -X POST 'http://127.0.0.1:8000/sessions/<返回的ID>/chat' \
   -H 'X-User-ID: user-a' -H 'Content-Type: application/json' \
   -d '{"message":"查杭州天气并记待办带伞"}'
 ```
+
+Chat 返回 `Content-Type: text/event-stream`，使用 POST + fetch 的流读取或 curl -N；
+浏览器原生 EventSource 不支持这个带 JSON body 的 POST 接口。事件格式为 `event: 名称` 加
+`data: JSON`，使用空行分帧：
+
+| 事件 | 内容 |
+| --- | --- |
+| start | session_id、trace_id |
+| text_delta | 主模型公开文本增量 text、当前模型调用轮次 round |
+| tool_use | 工具名、tool_use_id、running 状态与 mark |
+| tool_result | 相同 tool_use_id、结果状态、耗时、是否复用与 mark |
+| heartbeat | 空对象，默认每 15 秒空闲发送一次，可配置 AGENT_SSE_HEARTBEAT_SECONDS |
+| done | 原 ChatResponse 的完整字段，包含最终 text、task_status、用量和 trace_id |
+| error | 稳定 code 与可公开 message，作为失败终止事件，不再发送 done |
+
+工具标记参考 mt-agent，前端按 tool_use_id 更新同一张卡，安全渲染 mark：
+
+```text
+event: tool_use
+data: {"name":"calculator","tool_use_id":"call_1","status":"running","mark":"[工具调用中 · calculator]"}
+
+event: tool_result
+data: {"name":"calculator","tool_use_id":"call_1","status":"success","is_error":false,"duration_ms":1.2,"reused":false,"mark":"[tool=calculator · 工具 OK]"}
+```
+
+失败标记为“工具失败”，未知写结果标记为“结果待确认”，不能显示成确定成功或失败。
+恢复命中已有结果时只推送结果事件，不伪造一次新的工具调用。mark 只用于展示，不写入原始消息，
+也不回灌给模型；参数、内部推理和供应商签名不通过工具事件下发。
+
+真实模型请求使用 Anthropic 流式协议：text_delta 实时转发，同时收集完整的内容块、工具 JSON、
+thinking/signature 与累计 usage；整轮结束并校验后才执行工具。摘要和 Reflexion 文本不对外推送。
+流中可能包含工具调用前的说明，客户端应以 done.text 为最终答案，不要再次追加造成重复。
+已推送文本在收到 done 前均为未确认完整的输出；暂停也返回 done，请检查 task_status 和 stop_reason。
+
+鉴权、参数和会话归属错误在建立 SSE 前返回常规 HTTP 错误；窗口忙碌、任务冲突和运行异常等
+建立流之后的错误通过 error 事件返回。响应关闭会取消执行并等待 checkpoint、Trace 收尾；
+可通过查询任务并显式 continue 恢复。没有基于 Last-Event-ID 的自动重放或自动重试写操作。
+事件队列有界并提供反压，响应设置 no-cache 与 X-Accel-Buffering: no。
 
 0003 迁移将旧消息的 run_id 改为 turn_id，保留原消息，将旧运行表改名为
 agent_runs_archive 仅供审计，不参与当前代码。旧迁移与 SQL 留痕保留不变。
@@ -457,6 +495,65 @@ MINI_AGENT_TEST_REDIS_URL='redis://:TEST_REDIS_PASSWORD@127.0.0.1:6380/1' \
 添加依赖使用 `uv add 包名`，开发依赖使用 `uv add --dev 包名`。
 提交 `pyproject.toml` 与 `uv.lock`，以便复现相同依赖版本。
 
+## Trace 与执行步骤查询
+
+使用自研 `TraceRecorder` 显式埋点，不依赖 Langfuse SDK、Agent 框架或全局可变上下文。
+`agent_trace` 保存一次已通过会话归属校验并取得窗口锁的聊天请求，`agent_span` 保存步骤。
+鉴权失败和窗口忙碌的请求不会创建 Trace。新任务、继续和取消分别创建独立 trace_id；
+继续请求沿用 task_id，并记录请求开始时使用的 checkpoint_id。聊天响应返回 trace_id，CLI 同时打印。
+
+步骤按 parent_span_id 组织，type 为 span、generation 或 event：
+
+```text
+Trace（一次请求）
+├── context.prepare
+│   ├── generation.summary（发生压缩时）
+│   └── context.compressed（压缩前后输入量、摘要版本和覆盖边界）
+├── loop.round
+│   ├── generation.decision
+│   └── tool.calculator / tool.todo 等
+├── generation.reflection（需要复盘时）
+└── history.commit / task.paused / task.completed 等
+```
+
+轮次 Span 在其工具批次处理完后关闭。恢复时使用 loop.resume；命中已保存结果只记录
+`tool.result_reused` 事件，不新增实际工具执行 Span，也不重复追加旧的 ToolTrace。
+工具参数校验、超时和业务错误记录稳定错误码；工具失败后模型成功修正，整次 Trace 仍可成功。
+预算耗尽或等待补充信息分别记录 paused / waiting_user，普通执行错误为 error，取消为 cancelled。
+未收尾记录保留 running 与 incomplete=true，表示可能仍在执行或进程已中断，不伪造完成状态。
+
+每个 generation 记录普通输入、输出、缓存创建和缓存读取 Token，用量只向请求汇总一次，
+父 Span 不重复汇总。缺少 usage 或模型请求中断时记录预留值并标记 usage_estimated。
+继续请求仅统计本次新增调用，完成答案复用和取消请求的模型消耗为零。
+开始/结束时间使用 UTC，耗时使用单调时钟，不依赖系统时钟差值。
+
+采集参数：
+
+```dotenv
+AGENT_TRACING__ENABLED=true
+AGENT_TRACING__WRITE_TIMEOUT_SECONDS=0.25
+AGENT_TRACING__PREVIEW_CHARS=1024
+AGENT_TRACING__MAX_SPANS=512
+```
+
+开始和结束分别使用独立短事务，写入失败不回滚业务、不触发工具重放。
+本请求首次写入失败或超时后，后续写入直接降级，下个请求重新尝试；没有后台队列或自动重试。
+禁用采集不影响读取历史 Trace。采集数量超过上限时增加 dropped_spans，请求模型用量仍继续累计。
+默认只存有界脱敏摘要，过滤已知凭据字段、常见凭据表达式和 thinking/signature 内容块。
+模型输入记录消息数、工具名称与预算概况；大工具结果只记录体积，持久化成功后以事件关联 ref。
+这些摘要用于排障，不是完整 Prompt 快照，无法保证重放；原始结果仍由原有结果存储管理。
+埋点数据当前没有自动清理策略。
+
+查询接口复用现有网关令牌和 X-User-ID 身份，必须拥有对应窗口：
+
+| 方法 | 路径 | 功能 |
+| --- | --- | --- |
+| GET | /sessions/{id}/traces | 按开始时间倒序分页；支持 task_id、limit、offset |
+| GET | /sessions/{id}/traces/{trace_id} | 返回 trace、按 sequence 排序的 spans 和嵌套 tree |
+
+详情查询最多读取 1000 个步骤，超过时返回 truncated=true；正常采集上限不超过此数量。
+其他窗口或用户的 Trace 返回 404，查询不修改运行记录，也不会恢复或重放任务。
+
 ## 目录
 
 ```text
@@ -470,7 +567,9 @@ server/
   context.py               # 工具安全单元、首尾视图与滚动摘要边界
   cache.py                 # Redis 历史缓存和客户端
   llm.py                   # Anthropic 客户端与 Message、LLMTurn、ToolUse
-  agent_loop.py            # 自研 while 循环和工具执行 trace
+  agent_loop.py            # 自研 while 循环和显式步骤埋点
+  tracing.py               # 请求采集器、有界脱敏和故障隔离
+  sse.py                   # SSE 帧、工具 marker、心跳与断连收尾
   tools.py                 # 五个工具定义、注册表、默认注册
   skill_runner.py          # 参数校验、工具执行、超时、错误回灌
   routes/health.py         # 存活和就绪探针
@@ -480,6 +579,7 @@ server/
     todos.py               # 待办模型与作用域隔离的持久化访问
     sessions.py            # 会话、原始消息与摘要状态的短事务访问
     tool_results.py        # 独立结果原文和 Redis 读取缓存
+    traces.py              # Trace/Span 实体、短事务及步骤树查询
 migrations/                # Alembic 迁移环境及版本目录
 skills/
   _shared/                 # 可信工具上下文和业务错误

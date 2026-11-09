@@ -7,17 +7,19 @@
 
 边界：
     本模块只与模型通信；工具注册、执行和多轮控制分别由 tools、skill_runner、
-    agent_loop 负责。工具调用使用 run_turn，收齐整轮内容后再交给 Loop 执行。
+    agent_loop 负责。流式调用实时推送 text，收齐整轮内容后再交给 Loop 执行工具。
 """
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Literal
 
 import httpx
 from pydantic import BaseModel, Field
 
 from server.config import Settings
+
+TextDeltaCallback = Callable[[str], Awaitable[None]]
 
 # ============================================================================
 # Anthropic 消息与响应协议
@@ -40,11 +42,31 @@ class ToolUse(BaseModel):
     input: dict[str, Any]
 
 
+class TokenUsage(BaseModel):
+    """供应商返回的 Token 用量；普通输入、缓存创建和缓存读取分别累计。"""
+
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    cache_creation_input_tokens: int = Field(default=0, ge=0)
+    cache_read_input_tokens: int = Field(default=0, ge=0)
+
+    @property
+    def total(self) -> int:
+        """返回请求预算使用的总消耗，缓存输入也计入执行预算。"""
+        return (
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+        )
+
+
 class LLMTurn(BaseModel):
     """保留完整 content blocks，包含回灌所需的供应商签名等字段。"""
 
     content: list[dict[str, Any]]
     stop_reason: str
+    usage: TokenUsage | None = None
 
     @property
     def text(self) -> str:
@@ -105,6 +127,7 @@ class LLMClient:
         *,
         tools: list[dict[str, Any]] | None = None,
         system: str = "",
+        max_tokens: int | None = None,
     ) -> LLMTurn:
         """请求一次完整模型响应，不在客户端内部执行工具或继续循环。
 
@@ -112,6 +135,7 @@ class LLMClient:
             messages: 当前会话消息，包括前轮 assistant 和对应工具结果。
             tools: Anthropic 工具声明列表，参数格式为 input_schema。
             system: 请求顶层的系统提示词，不放入 messages。
+            max_tokens: 本次生成的输出上限，同时受部署配置的 llm_max_tokens 限制。
 
         Returns:
             包含完整 content blocks 和 stop_reason 的 LLMTurn。
@@ -122,14 +146,159 @@ class LLMClient:
         """
         if self.settings.llm_provider == "echo":
             return LLMTurn(
-                content=[{"type": "text", "text": self._echo(messages)}], stop_reason="end_turn"
+                content=[{"type": "text", "text": self._echo(messages)}],
+                stop_reason="end_turn",
+                usage=TokenUsage(),
             )
-        response = await self.client.post(
-            self.messages_path,
-            json=self._body(messages, system=system, tools=tools, stream=False),
-        )
+        body = self._body(messages, system=system, tools=tools, stream=False)
+        if max_tokens is not None:
+            body["max_tokens"] = min(max_tokens, self.settings.llm_max_tokens)
+        response = await self.client.post(self.messages_path, json=body)
         response.raise_for_status()
         return LLMTurn.model_validate(response.json())
+
+    async def stream_turn(
+        self,
+        messages: list[Message],
+        *,
+        tools: list[dict],
+        system: str,
+        max_tokens: int,
+        on_text_delta: TextDeltaCallback,
+    ) -> LLMTurn:
+        """实时转发文本并收集完整 Anthropic 响应，工具参数不按片段执行。
+
+        thinking/signature 与其他起始块字段原样保留；仅 text 进入公开回调。
+        usage 的后续值为累计计数，合并覆盖而非相加。缺失 message_stop、未闭合块、
+        无效 JSON 或供应商 error 均视为失败；输出截断时不解析不完整的工具参数。
+        """
+        if self.settings.llm_provider == "echo":
+            turn = await self.run_turn(messages, tools=tools, system=system, max_tokens=max_tokens)
+            await on_text_delta(turn.text)
+            return turn
+        body = self._body(messages, system=system, tools=tools, stream=True)
+        body["max_tokens"] = min(max_tokens, self.settings.llm_max_tokens)
+        blocks: list[dict[str, Any]] = []
+        open_index: int | None = None
+        partial_inputs: dict[int, str] = {}
+        usage: dict | None = None
+        stop_reason: str | None = None
+        started = False
+        async with self.client.stream("POST", self.messages_path, json=body) as response:
+            response.raise_for_status()
+            async for event in self._stream_events(response):
+                kind = event.get("type")
+                if kind == "error":
+                    raise RuntimeError("LLM provider returned a stream error")
+                if kind == "ping":
+                    continue
+                if kind == "message_start":
+                    if started:
+                        raise ValueError("Duplicate message_start")
+                    started = True
+                    usage = event["message"].get("usage")
+                    continue
+                if not started:
+                    raise ValueError("Missing message_start")
+                if kind == "content_block_start":
+                    index = event["index"]
+                    if open_index is not None or index != len(blocks):
+                        raise ValueError("Invalid content block order")
+                    block = dict(event["content_block"])
+                    blocks.append(block)
+                    open_index = index
+                    if block.get("type") == "text" and block.get("text"):
+                        await on_text_delta(block["text"])
+                elif kind == "content_block_delta":
+                    index = event["index"]
+                    if open_index is None or index != open_index:
+                        raise ValueError("Delta outside an open block")
+                    delta = event["delta"]
+                    block = blocks[index]
+                    delta_type = delta.get("type")
+                    if delta_type == "input_json_delta" and block.get("type") == "tool_use":
+                        partial_inputs[index] = (
+                            partial_inputs.get(index, "") + delta["partial_json"]
+                        )
+                    elif delta_type == "citations_delta" and block.get("type") == "text":
+                        block.setdefault("citations", []).append(delta["citation"])
+                    else:
+                        field = {
+                            "text_delta": "text",
+                            "thinking_delta": "thinking",
+                            "signature_delta": "signature",
+                        }.get(delta_type)
+                        expected = "text" if field == "text" else "thinking"
+                        if field is None or block.get("type") != expected:
+                            raise ValueError("Unsupported content delta")
+                        block[field] = block.get(field, "") + delta[field]
+                        if field == "text":
+                            await on_text_delta(delta[field])
+                elif kind == "content_block_stop":
+                    if open_index is None or event["index"] != open_index:
+                        raise ValueError("Unexpected content_block_stop")
+                    open_index = None
+                elif kind == "message_delta":
+                    stop_reason = event.get("delta", {}).get("stop_reason") or stop_reason
+                    if event.get("usage") is not None:
+                        usage = {**(usage or {}), **event["usage"]}
+                elif kind == "message_stop":
+                    if open_index is not None or stop_reason is None:
+                        raise ValueError("Incomplete streamed message")
+                    if stop_reason != "max_tokens":
+                        for index, raw in partial_inputs.items():
+                            blocks[index]["input"] = json.loads(raw)
+                    return LLMTurn(
+                        content=blocks,
+                        stop_reason=stop_reason,
+                        usage=TokenUsage.model_validate(usage) if usage is not None else None,
+                    )
+                else:
+                    raise ValueError("Unsupported stream event")
+        raise RuntimeError("LLM stream ended before message_stop")
+
+    @staticmethod
+    async def _stream_events(response: httpx.Response) -> AsyncIterator[dict]:
+        """按 SSE 空行组帧，支持多行 data，忽略注释及非 data 字段。"""
+        data: list[str] = []
+        async for line in response.aiter_lines():
+            if line == "":
+                if data:
+                    yield json.loads("\n".join(data))
+                    data = []
+            elif line.startswith("data:"):
+                data.append(line[5:].lstrip())
+
+    async def count_tokens(self, messages: list[Message], *, tools: list[dict], system: str) -> int:
+        """计数本次完整模型输入，供 Loop 在生成前预留预算。
+
+        Args:
+            messages: 将要发送的完整协议消息。
+            tools: 本次请求暴露的工具 Schema，也属于输入开销。
+            system: 与生成请求一致的顶层系统提示词。
+
+        Returns:
+            供应商报告的输入 Token 数。关闭计数或接口不支持时，返回 UTF-8 请求字节数
+            作为保守估算；echo 不调用模型，返回零。
+
+        Raises:
+            httpx.HTTPError: 除不支持接口之外的 HTTP 错误，交由上层暂停任务。
+            ValueError: 计数响应中的 input_tokens 无法转换为整数。
+
+        字节估算不是供应商精确计数，不承诺绝对零超支。
+        """
+        body = self._body(messages, system=system, tools=tools, stream=False)
+        body.pop("stream")
+        body.pop("max_tokens")
+        if self.settings.llm_provider == "echo":
+            return 0
+        # 仅在接口明确不支持时降级，避免掩盖鉴权失败、限流等服务错误。
+        if self.settings.llm_count_tokens:
+            response = await self.client.post(self.messages_path + "/count_tokens", json=body)
+            if response.status_code not in {404, 405, 501}:
+                response.raise_for_status()
+                return int(response.json()["input_tokens"])
+        return len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
 
     async def complete(self, messages: list[Message], *, system: str = "") -> str:
         """发起不带工具的单轮请求，并提取全部 text 块。"""

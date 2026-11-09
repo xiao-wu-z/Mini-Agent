@@ -30,7 +30,7 @@ class ScriptedLLM:
         self.turns = deque(turns)
         self.requests = []
 
-    async def run_turn(self, messages, *, tools, system):
+    async def run_turn(self, messages, *, tools, system, max_tokens=None):
         self.requests.append({"messages": [m.model_dump() for m in messages], "tools": tools})
         return self.turns.popleft()
 
@@ -58,6 +58,8 @@ async def test_native_http_roundtrip_and_full_block_feedback(monkeypatch):
 
     def respond(request):
         body = json.loads(request.content)
+        if request.url.path.endswith("/count_tokens"):
+            return httpx.Response(200, json={"input_tokens": 100})
         requests.append(body)
         if len(requests) == 1:
             assert body["tools"][0]["input_schema"]["type"] == "object"
@@ -148,7 +150,7 @@ async def test_timeout_is_a_tool_error():
         await asyncio.Event().wait()
 
     tools = create_default_tools()
-    tools.register(Tool("wait", "Wait", CalculatorArgs, wait))
+    tools.register(Tool("wait", "Wait", CalculatorArgs, wait, read_only=True))
     llm = ScriptedLLM(tool_turn(tool_call(name="wait", operation="add", left=1, right=2)), final())
     await AgentLoop(llm, tools, tool_timeout=0.01).run("等待")
     feedback = llm.requests[1]["messages"][-1]["content"][0]

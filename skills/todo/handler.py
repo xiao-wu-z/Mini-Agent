@@ -91,7 +91,11 @@ class TodoHandler:
                 raise SkillError(
                     SkillErrorCode.CONTEXT_REQUIRED, "新增待办需要运行和工具调用标识。"
                 )
-            create_key = sha256(f"{context.run_id}:{context.tool_use_id}".encode()).hexdigest()
+            # 检查点恢复沿用 operation_id，避免已提交但未回写结果的创建被重复执行。
+            # 直接调用 handler 未提供该标识时，仍使用运行与协议调用标识去重。
+            create_key = sha256(
+                (context.operation_id or f"{context.run_id}:{context.tool_use_id}").encode()
+            ).hexdigest()
             try:
                 item = await self.store.create(
                     **scope,
@@ -115,6 +119,14 @@ class TodoHandler:
             **scope,
             todo_id=arguments.todo_id,
         )
+        if not was_deleted and context.recovering:
+            # 恢复时记录已不存在的事实，不能声称是本次调用完成了删除。
+            return {
+                "action": "delete",
+                "todo_id": arguments.todo_id,
+                "deleted": False,
+                "already_absent": True,
+            }
         if not was_deleted:
             raise SkillError(SkillErrorCode.NOT_FOUND, "当前会话中未找到该待办。")
         return {"action": "delete", "todo_id": arguments.todo_id, "deleted": True}

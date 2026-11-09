@@ -45,7 +45,13 @@ async def invoke(name, arguments, *, store=None, context=None):
 
 def test_all_tools_are_registered_with_schemas():
     specs = create_default_tools().specs()
-    assert [spec["name"] for spec in specs] == ["calculator", "search", "todo", "weather"]
+    assert [spec["name"] for spec in specs] == [
+        "calculator",
+        "search",
+        "todo",
+        "weather",
+        "read_tool_result",
+    ]
     for spec in specs:
         assert spec["description"]
         assert spec["input_schema"]["additionalProperties"] is False
@@ -285,7 +291,7 @@ async def test_weather_to_todo_loop_and_tool_followup(todo_store):
     requests = []
 
     class ScenarioLLM:
-        async def run_turn(self, messages, *, tools, system):
+        async def run_turn(self, messages, *, tools, system, max_tokens=None):
             requests.append([message.model_dump() for message in messages])
             return turns.popleft()
 

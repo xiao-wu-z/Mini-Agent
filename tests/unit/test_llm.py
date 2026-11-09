@@ -124,3 +124,230 @@ async def test_echo_does_not_call_network():
         assert await client.complete([Message(role="user", content="hello")]) == "hello"
     finally:
         await client.close()
+
+
+async def test_token_count_fallback_and_output_cap(monkeypatch):
+    settings = real_settings(monkeypatch)
+    requests = []
+
+    def respond(request):
+        body = json.loads(request.content)
+        requests.append((request.url.path, body))
+        if request.url.path.endswith("/count_tokens"):
+            return httpx.Response(404)
+        return httpx.Response(
+            200,
+            json={
+                "content": [{"type": "text", "text": "你好"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 4, "output_tokens": 2, "cache_read_input_tokens": 3},
+            },
+        )
+
+    client = LLMClient(settings, transport=httpx.MockTransport(respond))
+    try:
+        messages = [Message(role="user", content="你好")]
+        assert await client.count_tokens(messages, tools=[], system="规则") > 0
+        result = await client.run_turn(messages, max_tokens=7)
+        assert requests[-1][1]["max_tokens"] == 7
+        assert result.usage.total == 9
+    finally:
+        await client.close()
+
+
+def sse_payload(*events):
+    return "".join("data: " + json.dumps(event, ensure_ascii=False) + "\n\n" for event in events)
+
+
+async def test_stream_turn_emits_text_before_completion_and_preserves_tool_blocks(monkeypatch):
+    import asyncio
+
+    seen = asyncio.Event()
+    received = []
+    first = sse_payload(
+        {
+            "type": "message_start",
+            "message": {
+                "usage": {"input_tokens": 4, "cache_read_input_tokens": 3, "output_tokens": 1}
+            },
+        },
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "thinking",
+                "thinking": "",
+                "signature": "",
+                "provider_field": "opaque",
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "内部内容"},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "signature_delta", "signature": "sig-1"},
+        },
+        {"type": "content_block_stop", "index": 0},
+        {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}},
+        {
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "text_delta", "text": "你好"},
+        },
+    )
+    rest = sse_payload(
+        {"type": "content_block_stop", "index": 1},
+        {
+            "type": "content_block_start",
+            "index": 2,
+            "content_block": {"type": "tool_use", "id": "call", "name": "calculator", "input": {}},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 2,
+            "delta": {"type": "input_json_delta", "partial_json": '{"operation":"add","left":1,'},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 2,
+            "delta": {"type": "input_json_delta", "partial_json": '"right":2}'},
+        },
+        {"type": "content_block_stop", "index": 2},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use"},
+            "usage": {"output_tokens": 2},
+        },
+        {"type": "message_delta", "delta": {}, "usage": {"output_tokens": 5}},
+        {"type": "message_stop"},
+    )
+
+    class ResponseStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield first.encode()
+            assert seen.is_set(), "Text must be emitted before the backend completes the response"
+            yield rest.encode()
+
+    def respond(request):
+        body = json.loads(request.content)
+        assert body["stream"] and body["max_tokens"] == 128
+        assert body["system"] == "规则"
+        return httpx.Response(200, stream=ResponseStream())
+
+    async def receive(text):
+        received.append(text)
+        seen.set()
+
+    client = LLMClient(real_settings(monkeypatch), transport=httpx.MockTransport(respond))
+    try:
+        turn = await client.stream_turn(
+            [Message(role="user", content="你好")],
+            tools=[],
+            system="规则",
+            max_tokens=128,
+            on_text_delta=receive,
+        )
+    finally:
+        await client.close()
+    assert received == ["你好"]
+    assert turn.content[0] == {
+        "type": "thinking",
+        "thinking": "内部内容",
+        "signature": "sig-1",
+        "provider_field": "opaque",
+    }
+    assert turn.content[2]["input"] == {"operation": "add", "left": 1, "right": 2}
+    assert turn.stop_reason == "tool_use" and turn.usage.total == 12
+
+
+async def test_truncated_stream_never_parses_or_executes_partial_tool_arguments(monkeypatch):
+    from server.agent_loop import AgentLoop
+    from server.tools import create_default_tools
+
+    payload = sse_payload(
+        {"type": "message_start", "message": {"usage": {"input_tokens": 5}}},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "partial",
+                "name": "calculator",
+                "input": {},
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '{"left":'},
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "max_tokens"},
+            "usage": {"output_tokens": 4},
+        },
+        {"type": "message_stop"},
+    )
+
+    def respond(request):
+        if request.url.path.endswith("/count_tokens"):
+            return httpx.Response(200, json={"input_tokens": 5})
+        return httpx.Response(200, text=payload)
+
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    client = LLMClient(real_settings(monkeypatch), transport=httpx.MockTransport(respond))
+    try:
+        result = await AgentLoop(client, create_default_tools()).run("计算", on_event=emit)
+    finally:
+        await client.close()
+    assert result.stop_reason == "max_tokens"
+    assert result.request_tokens == 9 and not result.tool_traces
+    assert not any(event.event == "tool_use" for event in events)
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        [],
+        [{"type": "error", "error": {"message": "private"}}],
+        [{"type": "message_stop"}],
+    ],
+)
+async def test_incomplete_tool_stream_is_rejected(monkeypatch, suffix):
+    payload = sse_payload(
+        {"type": "message_start", "message": {}},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "call", "name": "calculator", "input": {}},
+        },
+        *suffix,
+    )
+    client = LLMClient(
+        real_settings(monkeypatch),
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, text=payload)),
+    )
+
+    async def emit(text):
+        pytest.fail("No public text exists in this stream")
+
+    try:
+        with pytest.raises((RuntimeError, ValueError)):
+            await client.stream_turn(
+                [Message(role="user", content="执行")],
+                tools=[],
+                system="",
+                max_tokens=128,
+                on_text_delta=emit,
+            )
+    finally:
+        await client.close()

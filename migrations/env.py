@@ -10,6 +10,8 @@ from server.config import get_settings
 from server.store import (
     sessions,  # noqa: F401 -- 注册会话与消息模型。
     todos,  # noqa: F401 -- 注册 ORM 模型，供 autogenerate 读取 metadata。
+    tool_results,  # noqa: F401 -- 注册独立工具结果原文模型。
+    traces,  # noqa: F401 -- 注册请求与步骤埋点模型。
 )
 from server.store.base import Base
 

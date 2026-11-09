@@ -13,13 +13,14 @@ from server.agent_loop import AgentLoop
 from server.app import create_app
 from server.cache import SessionCache
 from server.config import get_settings
-from server.context import build_context
+from server.context import message_units
 from server.conversations import ConversationService
 from server.llm import LLMTurn
 from server.store.base import Base
 from server.store.sessions import ConversationError, SessionStore
 from server.store.todos import TodoStore
-from server.tools import create_default_tools
+from server.tools import Tool, create_default_tools
+from skills.calculator.handler import CalculatorArgs
 
 
 class TestModel:
@@ -29,7 +30,7 @@ class TestModel:
         self.requests = []
         self.turns = deque()
 
-    async def run_turn(self, messages, *, tools, system):
+    async def run_turn(self, messages, *, tools, system, max_tokens=None):
         self.requests.append([m.model_copy(deep=True) for m in messages])
         return (
             self.turns.popleft()
@@ -48,7 +49,7 @@ async def conversation(tmp_path):
     cache = SessionCache(redis, ttl_seconds=300)
     model = TestModel()
     loop = AgentLoop(model, create_default_tools(todo_store=TodoStore(store.session_factory)))
-    service = ConversationService(store, cache, loop, timeout_seconds=120, recent_turns=2)
+    service = ConversationService(store, cache, loop, timeout_seconds=120)
     yield service, model, redis
     await redis.aclose()
     await engine.dispose()
@@ -79,7 +80,6 @@ async def test_cache_and_service_recreation(conversation):
         service.cache,
         service.loop,
         timeout_seconds=120,
-        recent_turns=2,
     )
     await restored.chat("a", info.id, "继续")
     assert model.requests[-1][0].content == "之前的状态"
@@ -125,12 +125,11 @@ async def test_context_keeps_complete_tool_rounds(conversation):
         user_id="a", session_id=info.id, status=None, limit=10, offset=0
     )
     assert items[0].title == "带伞"
-    selected = build_context(history, recent_turns=1)
-    assert len(selected) == 4
+    assert message_units(history) == [(0, 1), (1, 3), (3, 4)]
     await service.chat("a", info.id, "下一轮")
     await service.chat("a", info.id, "第三轮")
     await service.chat("a", info.id, "第四轮")
-    assert model.requests[-1][0].content == "下一轮"
+    assert model.requests[-1][0].content == "记待办带伞"
     assert len(await service.history("a", info.id)) == 10
 
 
@@ -147,7 +146,7 @@ async def test_failure_never_saves_unpaired_tool_calls(conversation):
         await service.chat("a", info.id, "失败请求")
     assert await service.history("a", info.id) == []
     service.loop.llm = model
-    await service.chat("a", info.id, "新请求")
+    await service.chat("a", info.id, "新请求", action="continue")
 
 
 async def test_same_window_busy(conversation):
@@ -203,3 +202,217 @@ async def test_http_history_pagination_and_private_blocks(conversation):
         assert (
             await client.get(f"/sessions/{session_id}", headers={"X-User-ID": "b"})
         ).status_code == 404
+
+
+async def test_todo_write_then_crash_resumes_without_duplicate(conversation, monkeypatch):
+    service, model, _ = conversation
+    info = await service.store.create("a", "恢复任务")
+    model.turns.extend(
+        [
+            LLMTurn(
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": "todo-create",
+                        "name": "todo",
+                        "input": {"action": "create", "title": "带伞"},
+                    }
+                ],
+                stop_reason="tool_use",
+            ),
+            LLMTurn(content=[{"type": "text", "text": "已记录带伞"}], stop_reason="end_turn"),
+        ]
+    )
+    original = TodoStore.create
+
+    async def write_then_crash(self, **kwargs):
+        await original(self, **kwargs)
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(TodoStore, "create", write_then_crash)
+    with pytest.raises(asyncio.CancelledError):
+        await service.chat("a", info.id, "记待办带伞")
+    checkpoint = await service.store.load_task("a", info.id)
+    operation_id = checkpoint["operations"][0]["id"]
+    assert checkpoint["operations"][0]["status"] == "unknown"
+    with pytest.raises(ConversationError):
+        await service.chat("a", info.id, "新任务不能覆盖")
+    monkeypatch.setattr(TodoStore, "create", original)
+    restored = ConversationService(service.store, service.cache, service.loop, timeout_seconds=120)
+    result = await restored.chat("a", info.id, "继续", action="continue")
+    assert result.task_status == "completed"
+    assert result.turn_id == checkpoint["task_id"]
+    items, _ = await TodoStore(service.store.session_factory).list_items(
+        user_id="a", session_id=info.id, status=None, limit=10, offset=0
+    )
+    assert len(items) == 1
+    assert operation_id
+    saved = await service.store.load_task("a", info.id)
+    assert saved["history_saved"] is True
+    history = await restored.history("a", info.id)
+    assert history[1].content[0]["id"] == "todo-create"
+    assert history[2].content[0]["tool_use_id"] == "todo-create"
+
+
+async def test_cancel_pending_task_allows_new_goal(conversation):
+    service, model, _ = conversation
+    info = await service.store.create("a", "窗口")
+    service.loop.request_max_tokens = 1
+    result = await service.chat("a", info.id, "预算不足")
+    assert result.task_status == "paused"
+    cancelled = await service.chat("a", info.id, "取消", action="cancel")
+    assert cancelled.task_status == "cancelled"
+    service.loop.request_max_tokens = 64000
+    result = await service.chat("a", info.id, "新目标")
+    assert result.task_status == "completed"
+
+
+async def test_completed_checkpoint_is_committed_once_after_service_crash(
+    conversation, monkeypatch
+):
+    service, model, _ = conversation
+    info = await service.store.create("a", "窗口")
+    original = service.store.save_turn
+
+    async def fail(*args, **kwargs):
+        raise RuntimeError("simulated database interruption")
+
+    monkeypatch.setattr(service.store, "save_turn", fail)
+    with pytest.raises(RuntimeError):
+        await service.chat("a", info.id, "旧目标")
+    assert (await service.store.load_task("a", info.id))["status"] == "completed"
+    monkeypatch.setattr(service.store, "save_turn", original)
+    await service.chat("a", info.id, "新目标")
+    assert len(model.requests) == 2
+    assert [
+        message.content
+        for message in await service.history("a", info.id)
+        if isinstance(message.content, str)
+    ] == ["旧目标", "新目标"]
+
+
+async def test_continue_completed_task_replays_answer_without_model_call(conversation):
+    service, model, _ = conversation
+    info = await service.store.create("a", "窗口")
+    first = await service.chat("a", info.id, "目标")
+    count = len(model.requests)
+    replay = await service.chat("a", info.id, "继续", action="continue")
+    assert replay.text == first.text
+    assert replay.turn_id == first.turn_id
+    assert replay.request_tokens == 0
+    assert len(model.requests) == count
+
+
+async def test_unknown_write_requires_explicit_confirmation_before_retry(conversation):
+    service, model, _ = conversation
+    info = await service.store.create("a", "未知写操作")
+    attempts = []
+
+    async def write(arguments, context):
+        attempts.append(context.operation_id)
+        if len(attempts) == 1:
+            # 模拟开始调用后中断；调用方无法从检查点判断是否产生副作用。
+            raise asyncio.CancelledError()
+        return {"written": True}
+
+    service.loop.tools.register(
+        Tool("unsafe_write", "测试未知副作用的写工具", CalculatorArgs, write)
+    )
+    model.turns.append(
+        LLMTurn(
+            content=[
+                {
+                    "type": "tool_use",
+                    "id": "write",
+                    "name": "unsafe_write",
+                    "input": {"operation": "add", "left": 1, "right": 2},
+                }
+            ],
+            stop_reason="tool_use",
+        )
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await service.chat("a", info.id, "执行写操作")
+    operation_id = (await service.task("a", info.id))["operations"][0]["operation_id"]
+    paused = await service.chat("a", info.id, "继续", action="continue")
+    assert paused.task_status == "waiting_user"
+    assert len(attempts) == 1
+    with pytest.raises(ConversationError):
+        await service.chat(
+            "a", info.id, "继续", action="continue", confirmed_not_executed=["wrong-id"]
+        )
+    with pytest.raises(ConversationError):
+        await service.chat(
+            "b", info.id, "继续", action="continue", confirmed_not_executed=[operation_id]
+        )
+    completed = await service.chat(
+        "a",
+        info.id,
+        "已核实尚未执行",
+        action="continue",
+        confirmed_not_executed=[operation_id],
+    )
+    assert completed.task_status == "completed"
+    assert attempts == [operation_id, operation_id]
+
+
+async def test_compression_commits_original_history_and_summary_atomically(
+    conversation, monkeypatch
+):
+    import json
+
+    from server.config import ContextPolicy
+    from server.llm import Message, TokenUsage
+
+    service, model, _ = conversation
+    info = await service.store.create("a", "压缩窗口")
+    source = [
+        Message(role="user" if index % 2 == 0 else "assistant", content=f"{index}:" + "资料" * 100)
+        for index in range(10)
+    ]
+    await service.store.save_turn("a", info.id, "old-task", source, expected_version=0)
+    service.loop.context_policy = ContextPolicy(
+        window_tokens=2400,
+        keep_head_units=2,
+        keep_tail_units=2,
+        summary_max_tokens=64,
+        min_interval_seconds=0,
+    )
+    service.loop.max_output_tokens = 64
+    service.loop.token_margin = 0
+
+    async def count(messages, *, tools, system):
+        return len(json.dumps([m.model_dump() for m in messages], ensure_ascii=False)) + len(system)
+
+    monkeypatch.setattr(model, "count_tokens", count, raising=False)
+    model.turns.extend(
+        [
+            LLMTurn(
+                content=[{"type": "text", "text": "事实摘要"}],
+                stop_reason="end_turn",
+                usage=TokenUsage(input_tokens=10, output_tokens=2),
+            ),
+            LLMTurn(
+                content=[{"type": "text", "text": "新答案"}],
+                stop_reason="end_turn",
+                usage=TokenUsage(input_tokens=10, output_tokens=2),
+            ),
+        ]
+    )
+    reply = await service.chat("a", info.id, "新问题")
+    assert reply.rounds == 2
+    saved = await service.history("a", info.id)
+    assert len(saved) == 12 and saved[:10] == source
+    assert saved[10].content == "新问题"
+    assert all("事实摘要" not in str(message.content) for message in saved)
+    snapshot = await service.store.load_task("a", info.id)
+    context = await service.store.load_context("a", info.id)
+    assert snapshot["history_saved"] and context == snapshot["context_state"]
+    assert context["summary"] == "事实摘要"
+    assert 0 < context["end"] <= 10
+    restored = ConversationService(service.store, service.cache, service.loop, timeout_seconds=120)
+    before = len(model.requests)
+    await restored.chat("a", info.id, "追问")
+    assert len(model.requests) == before + 1
+    assert "事实摘要" in model.requests[-1][2].content
+    assert len(await restored.history("a", info.id)) == 14

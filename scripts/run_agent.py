@@ -22,6 +22,8 @@ from server.llm import LLMClient
 from server.store._db import Database
 from server.store.sessions import SessionStore
 from server.store.todos import TodoStore
+from server.store.tool_results import ToolResultStore
+from server.store.traces import TraceStore
 from server.tools import create_default_tools
 from skills._shared.context import ToolContext
 
@@ -36,8 +38,18 @@ async def main() -> None:
     parser.add_argument("--user-id", default=LOCAL_DEMO_USER_ID)
     parser.add_argument("--session-id", default=None)
     parser.add_argument("--session-title", default="命令行会话")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--continue-task", action="store_true")
+    actions.add_argument("--cancel-task", action="store_true")
+    parser.add_argument("--retry-operation", action="append", default=[])
     parser.add_argument("--stateless", action="store_true", help="仅调试 Loop，不保存对话历史")
     arguments = parser.parse_args()
+    if (arguments.continue_task or arguments.cancel_task) and (
+        arguments.stateless or not arguments.session_id
+    ):
+        parser.error("继续/取消任务必须提供 session-id，且不能使用 stateless。")
+    if arguments.retry_operation and not arguments.continue_task:
+        parser.error("retry-operation 只能用于显式继续任务。")
     settings = get_settings()
     if not arguments.stateless and not settings.mysql_enabled:
         parser.error("持久化会话需要启用 MySQL；只调试 Loop 时可显式使用 --stateless。")
@@ -48,8 +60,31 @@ async def main() -> None:
         if database is not None:
             stack.push_async_callback(database.close)
         todo_store = TodoStore(database.session_factory) if database is not None else None
-        tools = create_default_tools(todo_store=todo_store)
-        loop = AgentLoop(client, tools)
+        redis = create_redis(settings) if settings.redis_enabled else None
+        if redis is not None:
+            stack.push_async_callback(redis.aclose)
+        result_store = (
+            ToolResultStore(
+                database.session_factory,
+                redis=redis,
+                cache_ttl_seconds=settings.tool_result.cache_ttl_seconds,
+            )
+            if database is not None and not arguments.stateless
+            else None
+        )
+        tools = create_default_tools(todo_store=todo_store, result_store=result_store)
+        loop = AgentLoop(
+            client,
+            tools,
+            max_rounds=settings.request_max_steps,
+            tool_timeout=settings.agent_tool_timeout_seconds,
+            request_max_tokens=settings.request_max_tokens,
+            max_output_tokens=min(settings.request_max_output_tokens, settings.llm_max_tokens),
+            token_margin=settings.token_safety_margin,
+            context_policy=settings.context,
+            result_policy=settings.tool_result,
+            result_store=result_store,
+        )
         if arguments.stateless:
             context = ToolContext(
                 user_id=arguments.user_id, session_id=arguments.session_id or uuid4().hex
@@ -57,8 +92,6 @@ async def main() -> None:
             result = await loop.run(arguments.message, context=context)
             session_id = context.session_id
         else:
-            redis = create_redis(settings)
-            stack.push_async_callback(redis.aclose)
             store = SessionStore(database.session_factory)
             if arguments.session_id is None:
                 info = await store.create(arguments.user_id, arguments.session_title)
@@ -74,14 +107,23 @@ async def main() -> None:
                 ),
                 loop,
                 timeout_seconds=settings.agent_run_timeout_seconds,
-                recent_turns=settings.context_recent_turns,
+                trace_store=TraceStore(database.session_factory),
+                trace_policy=settings.tracing,
             )
             result = await service.chat(
                 arguments.user_id,
                 session_id,
                 arguments.message,
+                action="cancel"
+                if arguments.cancel_task
+                else "continue"
+                if arguments.continue_task
+                else "new",
+                confirmed_not_executed=arguments.retry_operation,
             )
         print(result.text)
+        if not arguments.stateless and result.trace_id is not None:
+            print(f"[trace_id={result.trace_id}]")
         print(f"[stop_reason={result.stop_reason}, rounds={result.rounds}]")
         if arguments.stateless:
             print(f"[session_id={session_id}, stateless=true]")

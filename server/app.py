@@ -16,6 +16,8 @@ from server.routes.sessions import router as sessions_router
 from server.store._db import Database
 from server.store.sessions import ConversationCode, ConversationError, SessionStore
 from server.store.todos import TodoStore
+from server.store.tool_results import ToolResultStore
+from server.store.traces import TraceStore
 from server.tools import create_default_tools
 
 
@@ -44,7 +46,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if app.state.database is not None
                 else None
             )
-            app.state.tools = create_default_tools(todo_store=todo_store)
+            result_store = (
+                ToolResultStore(
+                    app.state.database.session_factory,
+                    redis=app.state.redis,
+                    cache_ttl_seconds=settings.tool_result.cache_ttl_seconds,
+                )
+                if app.state.database is not None
+                else None
+            )
+            app.state.tools = create_default_tools(todo_store=todo_store, result_store=result_store)
             app.state.conversations = None
             if app.state.database is not None:
                 app.state.conversations = ConversationService(
@@ -53,9 +64,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         app.state.redis,
                         ttl_seconds=settings.session_cache_ttl_seconds,
                     ),
-                    AgentLoop(app.state.llm, app.state.tools),
+                    AgentLoop(
+                        app.state.llm,
+                        app.state.tools,
+                        max_rounds=settings.request_max_steps,
+                        tool_timeout=settings.agent_tool_timeout_seconds,
+                        request_max_tokens=settings.request_max_tokens,
+                        max_output_tokens=min(
+                            settings.request_max_output_tokens, settings.llm_max_tokens
+                        ),
+                        token_margin=settings.token_safety_margin,
+                        context_policy=settings.context,
+                        result_policy=settings.tool_result,
+                        result_store=result_store,
+                    ),
                     timeout_seconds=settings.agent_run_timeout_seconds,
-                    recent_turns=settings.context_recent_turns,
+                    trace_store=TraceStore(app.state.database.session_factory),
+                    trace_policy=settings.tracing,
                 )
             yield
 
@@ -82,7 +107,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def conversation_error(request: Request, exc: ConversationError) -> JSONResponse:
         if exc.code == ConversationCode.SESSION_NOT_FOUND:
             code = status.HTTP_404_NOT_FOUND
-        elif exc.code == ConversationCode.SESSION_BUSY:
+        elif exc.code in {
+            ConversationCode.SESSION_BUSY,
+            ConversationCode.TASK_PENDING,
+            ConversationCode.TASK_NOT_FOUND,
+        }:
             code = status.HTTP_409_CONFLICT
         elif exc.code == ConversationCode.RUN_TIMEOUT:
             code = status.HTTP_504_GATEWAY_TIMEOUT
